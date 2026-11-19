@@ -1,0 +1,36 @@
+[project]
+name = "saferagents-scanner"
+version = "2.0.0"
+description = "atif-scan over Service Binding RPC for the saferagents proxy"
+requires-python = ">=3.14"
+# atif-scan 0.8.23 is vendored in src/atif_scan/ (wheel sha256 23ca82da…ec68).
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "workers-py>=1.17.9",
+    "workers-runtime-sdk>=1.9.6",
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]
+# Parity tests (§9.2) against upstream safeagents at a pinned commit.
+parity = [
+    "safeagents @ git+https://github.com/huggingface/safeagents@dcf38e0a911d6e6a53966d46ecf1d9d6b86e3c01",
+    "atif-scan==0.8.23",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+extend-exclude = ["src/atif_scan", "python_modules", ".venv-workers"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # the formatter owns line length

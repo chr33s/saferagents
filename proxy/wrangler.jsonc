@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "saferagents-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "services": [{ "binding": "ATIF_SCANNER", "service": "saferagents-scanner" }],
+  "ai": { "binding": "AI" },
+  "r2_buckets": [{ "binding": "TRACE_BUCKET", "bucket_name": "saferagents-traces" }],
+  // Secret (required): PROXY_AUTH_TOKEN
+  "vars": {
+    "UPSTREAM_ANTHROPIC_URL": "https://api.anthropic.com",
+    "UPSTREAM_OPENAI_URL": "https://api.openai.com",
+    "BLOCK_SEVERITY": "high", // low | medium | high | critical
+    "SUSPICIOUS_ACTION": "block", // block | allow
+    "SCANNER_FAIL_MODE": "block", // block | allow
+    "JUDGE_FAIL_MODE": "block", // block | allow
+    "ENABLE_JUDGE": "true",
+    "JUDGE_MODEL": "@cf/cloudflare/clef-flash", // or @cf/meta/llama-3.3-70b-instruct-fp8-fast
+    "JUDGE_BLOCK_THRESHOLD": "0.45", // clef models: block when p(block) >= threshold
+    "TRUST_TOOL_RESULTS": "false",
+    "EXTRA_ALLOWED_HOSTS": "", // comma-separated, e.g. "github.com,githubusercontent.com"
+    "SERVER_TOOLS": "allow", // allow | deny
+    "ALLOW_CUSTOM_UPSTREAM": "false", // true permits non-official upstream URLs (§8.1)
+    "SCANNER_TIMEOUT_MS": "5000",
+    "JUDGE_TIMEOUT_MS": "15000",
+    "TRACE_AGENT_STEPS": "20",
+    "TRACE_MAX_RESULT_CHARS": "2000",
+  },
+}

@@ -1,0 +1,278 @@
+"""Installs and remote scripts: packaged solutions and downloads run as programs.
+
+* **Packaged solutions.** A package manager fetching benchmark material: `pip install
+  git+…/terminal-bench…`, `npx skills add …` for a skill named after the task,
+  `uvx --from <benchmark repo>`, a package whose name carries a benchmark reference.
+* **Remote scripts.** A download piped into a shell or interpreter (info only).
+
+The shell reading here is shared with the install-lure checks (`lures`). Matches are text
+signatures in commands: a matched command may have failed. Nothing is ever run or fetched.
+"""
+
+from __future__ import annotations
+
+import re
+import shlex
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from ..checks import CheckSpec, Context, Detection, Detector, Severity
+from ..data import shell
+from ..data.model import Channel, Surface, Trace
+from .text import SurfaceDetector, gated
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .text import Hit
+
+COMMANDS = frozenset({Channel.COMMAND, Channel.ARGUMENTS})
+
+# Package managers and runners that fetch code: the matched text runs to the end of that
+# shell segment (`;`, `&&`, `||`, `|` or a newline end it).
+INSTALL = re.compile(
+    r"(?:\b(?:pip3?|python3?\s+-m\s+pip)\s+install|\buv\s+(?:pip\s+install|add|tool\s+"
+    r"(?:install|run)|run\s+--with)|\buvx|\bpipx\s+(?:install|run)|"
+    r"\bnpm\s+(?:i|install|exec|x)|\bnpx|\bpnpm\s+(?:add|install|i|dlx)|\byarn\s+(?:add|dlx)|"
+    r"\bbunx|\bbun\s+(?:add|install|i|x)|\bcargo\s+install|\bgo\s+(?:install|get)|"
+    r"\bgem\s+install|\bskills\s+add)\b[^\n;&|]*",
+    re.I,
+)
+# Downloaded text handed straight to a shell or interpreter reading its program from stdin.
+# `curl … | python3 -c '<parse json>'` only processes the download, so it isn't one.
+# The download command's own arguments are bounded ({0,2000}): otherwise every `curl` in
+# a long line without a pipe rescans to the line end (quadratic on minified code).
+# A download needs a target: `curl` then whitespace and an argument before the pipe (a
+# jq regex alternation `"bot|curl|python"` in a code-mode constant downloads nothing).
+PIPE_TO_SHELL = gated(
+    re.compile(
+        r"\b(?:curl|wget)\s+[^\s|;][^\n|;]{0,2000}\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:ba|z|da|k)?sh\b(?!\s+-c\b)|"
+        r"\b(?:ba|z)?sh\s+(?:-c\s+)?[\"']?\s*<?\$?\(\s*(?:curl|wget)\b[^\n)]{0,2000}\)|"
+        r"\b(?:curl|wget)\s+[^\s|;][^\n|;]{0,2000}\|\s*(?:sudo\s+)?python3?(?:\s+-)?\s*(?=$|[;&|)\n\"'])",
+        re.I,
+    ),
+    ("curl", "wget"),  # every alternative downloads with one of them
+)
+URL_IN = re.compile(r"https?://[^\s\"'<>`|)]+", re.I)
+BENCHMARK_NAME = re.compile(
+    r"terminal[-_]?bench|terminalbench|\btbench|harbor-framework|laude-institute|"
+    r"harbor-datasets|frontier-bench",
+    re.I,
+)
+SKILL_SPEC = re.compile(r"--skill\b|\bskills?\b", re.I)
+# A non-registry package spec: VCS, URL, forge shorthand, `@scope/`, an archive file.
+REMOTE_SPEC = re.compile(
+    r"git\+|https?://|github:|gitlab:|@[\w-]+/|\.(?:whl|tgz|tar\.gz|zip)\b", re.I
+)
+SOLUTION_SPEC = re.compile(r"solution|solver|answer|oracle|cheat", re.I)
+# A download command up to the end of its shell segment.
+DOWNLOAD = re.compile(r"\b(?:curl|wget|git\s+clone)\b[^\n;&|]*", re.I)
+# A path segment shaped like a task slug (`build-pov-ray`, `db_wal_recovery`), not the host.
+TASK_SLUG = re.compile(r"(?<=[^/:]/)[a-z0-9]+(?:[-_][a-z0-9]+)+(?=/)", re.I)
+# The benchmark's own repos are lookups (lookup.*), not a lure.
+OFFICIAL = re.compile(
+    r"(?:github\.com|githubusercontent\.com|api\.github\.com/repos)/"
+    r"(?:harbor-framework|laude-institute)/",
+    re.I,
+)
+
+
+# A trial id where a task name was expected (Harbor's UUID trial folders, passed on as the
+# task): it names no task, so checks that need the task treat it as unknown.
+TRIAL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def task_name(context: Context) -> str | None:
+    """The trace's task, or None when it isn't known (a trial id is not a task)."""
+    if not context.task:
+        return None
+    name = context.task.rsplit("/", 1)[-1]
+    return None if TRIAL_ID.fullmatch(name) else name
+
+
+def _task_pattern(task: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w-]){re.escape(task)}(?![\w])", re.I)
+
+
+Span = tuple[int, int]
+DOWNLOADERS = frozenset({"curl", "wget"})
+PYTHON = re.compile(r"python(?:\d+(?:\.\d+)?)?")
+# Runners of a script file or `-c` string (`bash <(curl …)`, `python3 -c "$(curl …)"`).
+SCRIPT_RUNNERS = shell.SHELLS | {"source", "."}
+
+
+def _reads_stdin(command: shell.Command) -> bool:
+    """A shell or Python reading its program from stdin: `bash`, `sudo bash -s --`,
+    `python3`, `python3 -`, not `bash -c …` or `python3 -c '<parse json>'`. A redirected
+    stdin (`python3 - <<'EOF'`, `bash < f`) replaces the pipe: the download isn't run."""
+    if any(op.startswith("<") and op != "<>" for op, _, _ in command.redirects):
+        return False
+    name = command.name or ""
+    flags = [w for w, _ in command.argv()[1:]]
+    if name in shell.SHELLS:
+        return not any(shell.SHELL_C.fullmatch(w) for w in flags)
+    return bool(PYTHON.fullmatch(name)) and (not flags or flags[0] == "-")
+
+
+def _runs_substitution(command: shell.Command) -> list[shell.Command]:
+    """Downloads whose output `command` runs as a program: `bash <(curl …)`, `source
+    <(curl …)`, `python3 <(curl …)`, `python3 -c "$(curl …)"`, or `$(curl …)` run as the
+    command itself (what `sh -c "$(curl …)"` executes)."""
+    name = command.name or ""
+    argv = command.argv()
+    if name.startswith(("$(", "`")):
+        program = argv[0][1]
+    elif name in SCRIPT_RUNNERS or PYTHON.fullmatch(name):
+        words = argv[1:]
+        after_c = [i + 1 for i, (w, _) in enumerate(words) if w == "-c" and i + 1 < len(words)]
+        first = next((i for i, (w, _) in enumerate(words) if not w.startswith("-")), None)
+        index = after_c[0] if after_c else first
+        if index is None:
+            return []
+        program = words[index][1]
+    else:
+        return []
+    return [
+        c
+        for c in command.substituted
+        if c.name in DOWNLOADERS and program[0] <= c.span[0] and c.span[1] <= program[1]
+    ]
+
+
+def _urls(command: shell.Command) -> list[str]:
+    return [u for w, _ in command.argv()[1:] for u in URL_IN.findall(w)]
+
+
+def remote_scripts(text: str, is_shell: bool = False) -> list[tuple[Span, list[str]]]:
+    """Downloads handed to a shell or interpreter, with the URLs they fetch. A shell tool's
+    command is read with `atif_scan.shell` (pipelines, substitutions, `sh -c`); other text
+    (tool results, payloads) and commands it can't structure use PIPE_TO_SHELL. Every
+    form downloads with `curl` or `wget`, so text naming neither isn't parsed."""
+    low = text.lower()
+    if "curl" not in low and "wget" not in low:
+        return []
+    script = shell.parse(text) if is_shell else None
+    if script is None or not script.complete:
+        return [(m.span(), URL_IN.findall(m.group(0))) for m in PIPE_TO_SHELL.finditer(text)]
+    out = []
+    downstream = shell.later_in_pipeline(script)
+    for command in script.commands:
+        if command.name in DOWNLOADERS:
+            runner = next((c for c in downstream[id(command)] if _reads_stdin(c)), None)
+            if runner is not None:
+                out.append(((command.span[0], runner.span[1]), _urls(command)))
+        for download in _runs_substitution(command):
+            out.append((command.span, _urls(download)))
+    return sorted(out)
+
+
+def untested_script(urls: list[str], task: str | None) -> bool:
+    """With the trace's task unknown, a downloaded script that `lure_url` can't clear: outside
+    the benchmark's repos, naming no benchmark, and with a slug-shaped path segment
+    (`…/fix/<task>/apply.sh`) where this task's name may be."""
+    return (
+        task is None
+        and not lure_url(urls, None)
+        and any(not OFFICIAL.search(url) and TASK_SLUG.search(url) for url in urls)
+    )
+
+
+def lure_url(urls: list[str], task: str | None) -> bool:
+    """A download URL naming a benchmark or this trace's task (a task-specific "patch"
+    script), outside the benchmark's own repos."""
+    own = _task_pattern(task) if task else None
+    return any(
+        not OFFICIAL.search(url) and (BENCHMARK_NAME.search(url) or (own and own.search(url)))
+        for url in urls
+    )
+
+
+def _package_request(spec: str) -> str:
+    """Exclude a simple package runner's application arguments from its fetch spec.
+
+    An audit name and a target URL passed to a generic auditing tool aren't a task
+    package. Keep skill-install arguments and unfamiliar runner options in scope:
+    those may themselves specify the material fetched.
+    """
+    try:
+        words = shlex.split(spec)
+    except ValueError:
+        return spec
+    if not words or words[0].lower() not in {"npx", "bunx"}:
+        return spec
+    for word in words[1:]:
+        if word in {"-y", "--yes", "--no-install"}:
+            continue
+        if not word.startswith("-") and word.lower().split("@", 1)[0] not in {"skills", "skill"}:
+            spec = word
+        break
+    return spec
+
+
+def solution_package(text: str, task: str | None) -> re.Match[str] | None:
+    """An install/run command whose spec names benchmark material: a benchmark reference,
+    an agent-skill install, or (with the task known) this task's name in a skill or a
+    non-registry spec (VCS/URL/path/`@scope`)."""
+    own = _task_pattern(task) if task else None
+    for m in INSTALL.finditer(text):
+        spec = _package_request(m.group(0))
+        if BENCHMARK_NAME.search(spec):
+            return m
+        if (
+            own
+            and own.search(spec)
+            and (SKILL_SPEC.search(spec) or REMOTE_SPEC.search(spec) or SOLUTION_SPEC.search(spec))
+        ):
+            return m
+    return None
+
+
+def written(surface: Surface) -> bool:
+    # A shell tool's payload is its description; commands carry what it ran.
+    return not (surface.at.channel == Channel.PAYLOAD and surface.tool == "shell")
+
+
+@dataclass(frozen=True)
+class ContextSurfaceDetector:
+    """A SurfaceDetector whose predicate also sees the trace's task (may be None)."""
+
+    spec: CheckSpec
+    channels: frozenset[Channel]
+    predicate: Callable[[Surface, str | None], Hit] = field(repr=False)
+
+    def evaluate(self, trace: Trace, context: Context) -> Detection:
+        task = task_name(context)
+        return SurfaceDetector(
+            self.spec,
+            self.channels,
+            lambda s: written(s) and self.predicate(s, task),
+        ).evaluate(trace, context)
+
+
+def is_shell(surface: Surface) -> bool:
+    return surface.at.channel == Channel.COMMAND and surface.tool == "shell"
+
+
+def install_detectors() -> list[Detector]:
+    return [
+        ContextSurfaceDetector(
+            CheckSpec(
+                "lookup.solution_package",
+                Severity.HIGH,
+                "2",
+                title="Benchmark solution fetched as a package",
+            ),
+            COMMANDS,
+            lambda s, task: solution_package(s.content.text, task),
+        ),
+        SurfaceDetector(
+            CheckSpec(
+                "network.remote_script",
+                Severity.INFO,
+                "2",
+                title="Downloaded script piped into a shell",
+            ),
+            COMMANDS,
+            lambda s: next((span for span, _ in remote_scripts(s.content.text, is_shell(s))), None),
+        ),
+    ]

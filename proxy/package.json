@@ -1,0 +1,33 @@
+{
+  "name": "saferagents-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsrs -p .",
+    "lint": "oxlint --deny-warnings && oxfmt --check && tsrs -p .",
+    "format": "oxfmt",
+    "test": "vitest run",
+    "trace-dump": "node scripts/trace-dump.ts",
+    "mock-upstream": "node scripts/mock-upstream.ts",
+    "e2e": "node scripts/e2e.ts",
+    "bench:cpu": "node scripts/bench-cpu.ts",
+    "judge:eval": "node scripts/judge-eval.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.8.5",
+    "@cloudflare/workers-types": "5.20261119.1",
+    "@types/node": "26.6.6",
+    "oxfmt": "0.79.0",
+    "oxlint": "1.94.0",
+    "tsrs": "7.1.0-beta.tsrs3",
+    "vitest": "5.1.1",
+    "wrangler": "4.165.0"
+  },
+  "allowScripts": {
+    "workerd@1.20261118.1": true,
+    "esbuild@0.28.2": true,
+    "fsevents": false
+  }
+}

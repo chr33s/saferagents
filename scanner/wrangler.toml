@@ -1,0 +1,8 @@
+name = "saferagents-scanner"
+main = "src/entry.py"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["python_workers"]
+workers_dev = false  # no routes: only service bindings reach this Worker
+
+[observability]
+enabled = true

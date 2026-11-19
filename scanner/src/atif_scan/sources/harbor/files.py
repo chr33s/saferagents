@@ -1,0 +1,516 @@
+"""Harbor's own run files, for local and hf:// job folders (the Hub source has its own).
+
+Harbor writes, per trial, `<trial>/result.json` (task name, verifier rewards, agent
+token/cost totals, exception type, timing) and, per job, `<job>/config.json` (job name,
+datasets with digests, n_attempts, timeout/resource settings) and `<job>/result.json`
+(trial counts, token/cost totals). These are recorded run facts, like the Hub listing,
+so they take precedence over inferences from folder names or trajectories. Only
+allowlisted numbers, codes and identifiers are extracted.
+
+Runs published by harbor-hf wrap the job folder: `<run>/run.json` declares the run's
+token prices (`pricing`, $ per million input/cached/output tokens), and
+`<run>/attempt-costs/<attempt id>.json` records each trial's cost next to the trace
+(`attempt_id` is the trial result.json's `id`). Harnesses often leave cost out of the
+trajectory and result.json, so these are where a run's cost is recorded.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
+from itertools import pairwise
+
+from ...data.accounting import TOKEN_KEYS, harbor_accounting
+from ...data.jsonval import (
+    Doc,
+    JsonObject,
+    as_list,
+    as_object,
+    as_str,
+    count,
+    identifier,
+    is_object,
+    load_object,
+    number,
+)
+
+MAX_BYTES = 1024 * 1024
+# Leaderboard static rules: these settings must be unset (multipliers may be 1.0).
+OVERRIDE = re.compile(
+    r"(?:^|[._])(?:\w*timeout_multiplier|override_timeout_sec|override_setup_timeout_sec|"
+    r"max_timeout_sec|override_(?:cpus|gpus|memory_mb|storage_mb))$"
+)
+
+
+def _flatten(value: object, prefix: str = "") -> Iterator[tuple[str, object]]:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            yield from _flatten(child, f"{prefix}.{key}" if prefix else str(key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _flatten(child, f"{prefix}[{index}]")
+    else:
+        yield prefix, value
+
+
+# Settings that only change how the environment is provisioned (image builds, agent
+# install): allowed "infrastructure replacements" for private runs. Everything else in
+# OVERRIDE changes what the agent is given (time, resources) and so affects the score.
+INFRA_OVERRIDE = re.compile(r"setup_timeout|build_timeout", re.I)
+# Datasets whose tasks are the published benchmark (registry name or upstream repo).
+CANONICAL_DATASETS = re.compile(
+    r"^(?:terminal-bench/[\w.-]+|(?:https?://)?github\.com/(?:harbor-framework|laude-institute)/"
+    r"terminal-bench[\w.-]*?(?:\.git)?)$",
+    re.I,
+)
+# Free-text Harbor labels (names, refs, display strings): printable words and
+# punctuation only, never a URL or control characters.
+TEXT = re.compile(r"[\w .,:@/()$%+~#-]+")
+GIT_REPO = re.compile(
+    r"^(?:https?://)?(github\.com/[\w.-]+/[\w.-]+?)(?:\.git)?(?:@([0-9a-f]{7,40}))?$"
+)
+
+
+def override_kind(path: str) -> str:
+    """`infrastructure` (provisioning only) or `scoring` (time/resources the agent gets)."""
+    return "infrastructure" if INFRA_OVERRIDE.search(path) else "scoring"
+
+
+def text_label(value: object, limit: int = 200) -> str | None:
+    """The one validator for free-text labels from Harbor files or the Hub (truncated)."""
+    if not isinstance(value, str) or "://" in value or not TEXT.fullmatch(value[:limit]):
+        return None
+    return value[:limit]
+
+
+def duration(record: Mapping[str, object]) -> float | None:
+    """Seconds from `started_at` to `finished_at` (ISO timestamps), else None."""
+    try:
+        start = datetime.fromisoformat(str(record["started_at"]))
+        end = datetime.fromisoformat(str(record["finished_at"]))
+        seconds = (end - start).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+# (name, ref, canonical) of a dataset, each None when unknown.
+DatasetSource = tuple[str | None, str | None, bool | None]
+UNKNOWN_DATASET: DatasetSource = (None, None, None)
+
+
+def dataset_source(entry: Mapping[str, object]) -> DatasetSource:
+    """(name, ref, canonical) for a job config dataset: a registry name, or a git repo
+    (`repo: https://github.com/OWNER/REPO.git@COMMIT`, `path: tasks`)."""
+    name = entry.get("name")
+    if isinstance(name, str) and name:
+        if text_label(name) is None:
+            return UNKNOWN_DATASET
+        return name, text_label(entry.get("ref")), bool(CANONICAL_DATASETS.match(name))
+    repo = as_str(entry.get("repo"))
+    match = GIT_REPO.match(repo.strip()) if repo is not None else None
+    return _git_dataset(match, entry) if match else UNKNOWN_DATASET
+
+
+def _git_dataset(match: re.Match[str], entry: Mapping[str, object]) -> DatasetSource:
+    repo = str(match.group(1))
+    path = as_str(entry.get("path")) or ""
+    label = repo + (f"/{path.strip('/')}" if path else "")
+    if text_label(label) != label:
+        return UNKNOWN_DATASET
+    return label, as_str(match.group(2)), bool(CANONICAL_DATASETS.match(repo))
+
+
+def overrides(config: object) -> list[str]:
+    """Setting paths the leaderboard requires unset (a multiplier of 1.0 is allowed)."""
+    found = []
+    for path, value in _flatten(config):
+        if not OVERRIDE.search(path) or value is None:
+            continue
+        if path.endswith("multiplier") and value in (1, 1.0):
+            continue
+        found.append(re.sub(r"\[\d+\]", "[]", path))
+    return sorted(set(found))
+
+
+def _json(data: bytes | None) -> JsonObject:
+    return load_object(data, MAX_BYTES)
+
+
+def _label(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return identifier(value)
+    except ValueError:
+        return None
+
+
+def primary_reward(rewards: object) -> float | None:
+    """Harbor's rewards dict: the `reward` key, else a single numeric value."""
+    if number(rewards) is not None:
+        return number(rewards)
+    if not isinstance(rewards, dict):
+        return None
+    rewards = as_object(rewards)
+    if "reward" in rewards:
+        return number(rewards["reward"])
+    values = [number(v) for v in rewards.values()]
+    return values[0] if len(values) == 1 else None
+
+
+# Harbor's trial phases in order (result.json keys), for when a trial failed.
+PHASES = ("environment_setup", "agent_setup", "agent_execution", "verifier")
+
+
+def comparable(a: datetime, b: datetime) -> bool:
+    """Both carry a UTC offset, or neither: a naive time can't be placed among aware ones
+    (Harbor has written exception times as naive local time beside UTC phase times)."""
+    return (a.tzinfo is None) == (b.tzinfo is None)
+
+
+def failed_phase(d: Mapping[str, object], occurred_at: object) -> str | None:
+    """The phase whose window holds the exception's timestamp: a fixed phase name, or
+    "after" a finished phase when it fell between or after them; None when unknown,
+    including when the exception time and the phase times aren't comparable."""
+    try:
+        when = datetime.fromisoformat(str(occurred_at))
+    except (TypeError, ValueError):
+        return None
+    last = None
+    for phase in PHASES:
+        record = as_object(d.get(phase))
+        try:
+            start = datetime.fromisoformat(str(record["started_at"]))
+            end = datetime.fromisoformat(str(record["finished_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (comparable(when, start) and comparable(start, end)):
+            return None
+        if start <= when <= end:
+            return phase
+        if end < when:
+            last = phase
+    return f"after_{last}" if last else None
+
+
+def phase_durations(d: Mapping[str, object]) -> Doc:
+    """Seconds spent setting up (environment + agent install) and verifying."""
+    setup = [duration(as_object(d.get(p))) for p in ("environment_setup", "agent_setup")]
+    known = [s for s in setup if s is not None]
+    return {
+        "setup_duration_sec": sum(known) if known else None,
+        "verifier_duration_sec": duration(as_object(d.get("verifier"))),
+    }
+
+
+def is_trial_receipt(data: bytes | None, trial: str) -> bool:
+    """Recognize a standalone trial result, not merely a file with a task label.
+
+    Bind the receipt to its listed folder; nullable outcome objects also cover trials
+    that failed before agent execution. No receipt-supplied paths are followed.
+    """
+    d = _json(data)
+    task = as_str(d.get("task_name"))
+    outcomes = {"agent_result", "verifier_result", "exception_info"} & d.keys()
+    return (
+        d.get("trial_name") == trial
+        and bool(task and task.strip())
+        and bool(outcomes)
+        and all(d[key] is None or is_object(d[key]) for key in outcomes)
+    )
+
+
+def trial_result(data: bytes | None) -> Doc:
+    """Allowlisted facts from a trial's result.json ({} when absent or unreadable)."""
+    d = _json(data)
+    if not d or not ({"trial_name", "task_name"} & set(d)):
+        return {}  # not a trial result (e.g. a job-level result.json)
+    agent = as_object(d.get("agent_result"))
+    verifier = as_object(d.get("verifier_result"))
+    exception = as_object(d.get("exception_info"))
+    attempt = as_str(d.get("id"))
+    task = str(d.get("task_name") or "").rsplit("/", 1)[-1]
+    meta = {
+        "task": _label(task),
+        "reward": primary_reward(verifier.get("rewards")),
+        "error_type": (_label(exception.get("exception_type")) or "exception")
+        if exception
+        else None,
+        "accounting": harbor_accounting(agent),
+        "cost_usd": number(agent.get("cost_usd"), 0),
+        "input_tokens": count(agent.get("n_input_tokens")),
+        "cache_tokens": count(agent.get("n_cache_tokens")),
+        "output_tokens": count(agent.get("n_output_tokens")),
+        "duration_sec": duration(d),
+        "agent_duration_sec": duration(as_object(d.get("agent_execution"))),
+        **phase_durations(d),
+        "failed_phase": failed_phase(d, exception.get("occurred_at")) if exception else None,
+        # Harbor's trial id (a UUID): the key of harbor-hf's attempt-costs file. Used for
+        # that lookup only, never reported.
+        "attempt_id": attempt if attempt and ATTEMPT_ID.fullmatch(attempt) else None,
+    }
+    facts: Doc = {k: v for k, v in meta.items() if v is not None}
+    if meta["accounting"] is not None:
+        # Explicit unknown observed counts must also override older listing totals.
+        facts.update({k: meta[k] for k in TOKEN_KEYS})
+    return facts
+
+
+TRIAL_LEDGER = "trials.jsonl"
+LEDGER_BYTES = 16 * 1024 * 1024  # ~500 bytes per trial
+LEDGER_TRIAL = re.compile(r"[A-Za-z0-9][\w.-]{0,127}")
+
+
+def _ledger_row(line: str) -> tuple[str, Doc] | None:
+    """(trial folder, allowlisted facts) from one ledger line; None when malformed."""
+    try:
+        row = as_object(json.loads(line))
+    except (ValueError, RecursionError):
+        return None
+    name = as_str(row.get("trial_name"))
+    if row.get("schema_version") != 1 or name is None or not LEDGER_TRIAL.fullmatch(name):
+        return None
+    error = row.get("error_type")
+    meta = {
+        "task": _label(str(row.get("task_name") or "").rsplit("/", 1)[-1]),
+        "reward": number(row.get("reward")),
+        "error_type": (_label(error) or "other") if error else None,
+        "cost_usd": number(row.get("cost_usd"), 0),
+        "input_tokens": count(row.get("input_tokens")),
+        "cache_tokens": count(row.get("cached_input_tokens")),
+        "output_tokens": count(row.get("output_tokens")),
+        "duration_sec": duration(row),
+    }
+    return name, {k: v for k, v in meta.items() if v is not None}
+
+
+def trial_ledger(data: bytes | None) -> dict[str, Doc]:
+    """{trial folder: allowlisted facts} from a run's `trials.jsonl` ledger.
+
+    One JSON object per trial (schema_version 1): `trial_name` (the trial folder),
+    `task_name`, `reward`, `error_type`, `cost_usd`, `input_tokens` (incl. cached),
+    `cached_input_tokens`, `output_tokens`, `started_at`/`finished_at`. These are
+    recorded run facts, like a trial's result.json. Malformed lines are skipped; a
+    trial listed more than once is ambiguous and dropped (unknown, not a guess).
+    """
+    if not data or len(data) > LEDGER_BYTES:
+        return {}
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeError:
+        return {}
+    found: dict[str, Doc] = {}
+    repeated: set[str] = set()
+    for parsed in map(_ledger_row, lines):
+        if parsed is None:
+            continue
+        name, facts = parsed
+        if name in found:
+            repeated.add(name)
+        found[name] = facts
+    return {k: v for k, v in found.items() if k not in repeated}
+
+
+RUN_MANIFEST = "run.json"  # harbor-hf: <run>/run.json next to <run>/job/
+RUN_MANIFEST_BYTES = 256 * 1024
+ATTEMPT_COSTS = "attempt-costs"  # harbor-hf: <run>/attempt-costs/<attempt id>.json
+ATTEMPT_COST_BYTES = 4096
+ATTEMPT_ID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+PRICE_KINDS = ("uncached_input", "cached_input", "output")
+
+
+def declared_prices(data: bytes | None) -> dict[str, float] | None:
+    """{uncached_input, cached_input, output} $/M tokens a harbor-hf `run.json` declares
+    (`pricing.{input,cached,output}_usd_per_million`), or None. `input` is the price of
+    uncached input: cached tokens have their own rate. Only USD (or no currency) and
+    finite, non-negative numbers; anything else is unknown, never a zero price."""
+    d = _json(data) if data and len(data) <= RUN_MANIFEST_BYTES else {}
+    pricing = d.get("pricing")
+    if not is_object(pricing) or pricing.get("currency", "USD") != "USD":
+        return None
+    rates = [number(pricing.get(f"{k}_usd_per_million"), 0) for k in ("input", "cached", "output")]
+    known = [r for r in rates if r is not None]
+    if len(known) != len(PRICE_KINDS):
+        return None
+    return dict(zip(PRICE_KINDS, known, strict=True))
+
+
+def attempt_cost(data: bytes | None, attempt_id: str, trial: str) -> float | None:
+    """The cost a harbor-hf `attempt-costs/<attempt id>.json` records for this trial, or
+    None (absent, null, malformed, or naming another attempt or trial folder)."""
+    d = _json(data) if data and len(data) <= ATTEMPT_COST_BYTES else {}
+    if d.get("attempt_id") != attempt_id or d.get("trial_name") != trial:
+        return None
+    return number(d.get("cost_usd"), 0)
+
+
+# A Harbor job whose trials start after a gap this long (and are at most this share of
+# the job) was topped up later: replacements or reruns added after the job itself ran.
+LATE_GAP_SEC = 3600
+LATE_SHARE = 0.1
+LATE_MIN_TRIALS = 2  # a small job may still have one or two late trials
+MIN_STARTS = 2  # a gap needs two start times
+
+
+def started(record: Mapping[str, object]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(record["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def late_trials(records: Sequence[Mapping[str, object]]) -> Doc | None:
+    """Trials of one job that started after a gap of LATE_GAP_SEC or more following all of
+    its others (at most LATE_SHARE of the job): added to the job after it had run, e.g.
+    replacements of failed trials. {trials, rewarded, gap_hours}, or None when there are
+    none (or start times are missing)."""
+    timed = [(t, r) for r in records if (t := started(r)) is not None]
+    if len(timed) < len(records) or len(timed) < MIN_STARTS:
+        return None
+    if len({t.tzinfo is None for t, _ in timed}) > 1:
+        return None  # naive and aware start times can't be ordered
+    timed.sort(key=lambda tr: tr[0])
+    gaps = [(b[0] - a[0]).total_seconds() for a, b in pairwise(timed)]
+    cut = max(range(len(gaps)), key=gaps.__getitem__)
+    tail = timed[cut + 1 :]
+    if gaps[cut] < LATE_GAP_SEC or len(tail) > max(LATE_MIN_TRIALS, LATE_SHARE * len(timed)):
+        return None
+    return {
+        "trials": len(tail),
+        "rewarded": sum(1 for _, r in tail if (number(r.get("reward")) or 0) > 0),
+        "gap_hours": round(gaps[cut] / 3600, 1),
+    }
+
+
+SUBMISSION_BYTES = 1024 * 1024
+UUID_TEXT = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+FILTER_KEYS = ("agent", "agent_version", "model_name", "reasoning_effort")
+
+
+def submission(data: bytes | None) -> Doc | None:
+    """A leaderboard submission file (terminal-bench leaderboard/submissions/*.json): the
+    Hub jobs it assembles (`source_jobs`, as job UUIDs) and the `source_filter` that picks
+    its trials from them (agent, agent_version, model_name, reasoning_effort labels).
+    None when it isn't one."""
+    d = load_object(data, SUBMISSION_BYTES)
+    jobs = [
+        m.group(0).lower()
+        for j in as_list(d.get("source_jobs"))
+        if isinstance(j, str) and (m := UUID_TEXT.search(j))
+    ]
+    if not jobs:
+        return None
+    raw = as_object(d.get("source_filter"))
+    return {
+        "jobs": list(dict.fromkeys(jobs)),
+        "filter": {k: v for k in FILTER_KEYS if (v := text_label(raw.get(k)))},
+    }
+
+
+def configured_agents(cfg: Mapping[str, object]) -> int | None:
+    """How many agent/model entries a job config plans (a comparison job runs several,
+    so several models are expected rather than a substitution)."""
+    agents = cfg.get("agents")
+    if not isinstance(agents, list):
+        return None
+    return len([a for a in agents if isinstance(a, dict)]) or None
+
+
+def _listed_names(ev: JsonObject) -> Iterator[str]:
+    """Trial names in one eval's `reward_stats` ({metric: {value: [names]}}) and
+    `exception_stats` ({exception type: [names]})."""
+    rewards = as_object(ev.get("reward_stats")).values()
+    groups = [v for by_value in rewards for v in as_object(by_value).values()]
+    groups += as_object(ev.get("exception_stats")).values()
+    for values in groups:
+        yield from (v for v in as_list(values) if isinstance(v, str) and v)
+
+
+def job_listed_trials(result: bytes | None) -> frozenset[str] | None:
+    """Trial folder names the job's own result.json accounts for (its per-eval
+    `reward_stats` and `exception_stats`), or None when that can't be trusted: no
+    listing, or fewer names than the job says it completed. Unknown, never "none"."""
+    stats = as_object(_json(result).get("stats"))
+    evals = stats.get("evals")
+    if not is_object(evals):
+        return None
+    names = {name for ev in evals.values() for name in _listed_names(as_object(ev))}
+    completed = count(stats.get("n_completed_trials"))
+    if not names or (completed is not None and len(names) < completed):
+        return None
+    return frozenset(names)
+
+
+def job_meta(config: bytes | None, result: bytes | None) -> Doc | None:
+    """Run facts from a Harbor job folder's config.json/result.json (None if not a job)."""
+    cfg, res = _json(config), _json(result)
+    if not cfg or not ({"datasets", "agents", "n_attempts"} & set(cfg)):
+        return None
+    stats = as_object(res.get("stats"))
+    datasets = [as_object(d) for d in as_list(cfg.get("datasets")) if is_object(d)]
+    task_names = [n for d in datasets for n in as_list(d.get("task_names"))]
+    sources = [dataset_source(d) for d in datasets]
+    completed = count(stats.get("n_completed_trials"))
+    return {
+        "source": "harbor_job_folder",
+        "job_id": _label(str(res.get("id") or "")),
+        "job_name": text_label(cfg.get("job_name")),
+        "planned_trials": count(res.get("n_total_trials")),
+        "total_trials": count(res.get("n_total_trials")),
+        "completed_trials": completed,
+        "errored_trials": count(stats.get("n_errored_trials")),
+        "listed_trials": None,
+        "datasets": [n for n, _, _ in sources if n],
+        "dataset_refs": [r for _, r, _ in sources if r],
+        # False when the tasks came from a fork or copy (e.g. a git repo other than the
+        # benchmark's own); None when unknown.
+        "canonical_dataset": (
+            None
+            if not sources or any(c is None for _, _, c in sources)
+            else all(c for _, _, c in sources)
+        ),
+        "config_task_names": len(task_names) or None,
+        "n_attempts": count(cfg.get("n_attempts")),
+        "configured_agents": configured_agents(cfg),
+        "cost_usd": number(stats.get("cost_usd"), 0),
+        "overrides": overrides(cfg),
+    }
+
+
+FAST_AGENT_RESULTS = "fast-agent-results.json"
+FAST_AGENT_RESULTS_BYTES = 32 * 1024 * 1024
+SAFETY_CHANNEL = "fast-agent-safety-details"
+SAFETY_CODE = re.compile(r"[a-z][a-z0-9_-]{0,40}")
+
+
+def safety_details(data: bytes | None) -> Doc:
+    """Provider safety codes from fast-agent's results file: the last assistant message's
+    `fast-agent-safety-details` channel. Only `provider`, `reason` and `category`, each
+    an identifier-like code; the provider's explanation text is never read out."""
+    messages = as_list(_json(data).get("messages"))
+    for message in reversed(messages):
+        msg = as_object(message)
+        if msg.get("role") != "assistant":
+            continue
+        for block in as_list(as_object(msg.get("channels")).get(SAFETY_CHANNEL)):
+            try:
+                detail = as_object(json.loads(as_str(as_object(block).get("text")) or ""))
+            except (ValueError, RecursionError):
+                continue
+            codes = {
+                f"safety_{key}": value.lower()
+                for key in ("provider", "reason", "category")
+                if isinstance(value := detail.get(key), str)
+                and SAFETY_CODE.fullmatch(value.lower())
+            }
+            if codes:
+                return codes
+        return {}
+    return {}

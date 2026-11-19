@@ -1,0 +1,484 @@
+"""Static trajectory viewer export: allowlisted findings plus whole-field masked text
+(trace fields and judge reasons).
+
+Unlike reports, this export deliberately contains trace text so a reviewer can publish
+an individually checked trajectory. Every field is masked as a whole (best effort)
+before it is written; highlights are only offsets proven against that masked text.
+Nothing in a trace is executed, fetched or interpreted as markup by the viewer.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+from copy import deepcopy
+from importlib import resources
+from typing import TYPE_CHECKING
+
+from ..data.jsonval import as_object, as_str
+from ..data.loader import load_bytes
+from ..evidence.cite import mask, trace_secrets
+from ..evidence.extract import _segment_content, _segment_status
+from ..output.brief_view import sections
+from ..review.coverage import UNIVERSAL
+from .answers import answer_rows, question_labels
+from .findings import apply_titles, fields, findings, first_span
+from .focus import masked_focus
+from .session import pinned_bytes
+from .web import web_gap_details
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from pathlib import Path
+
+    from ..cli.inputs import Record
+    from ..data.jsonval import Doc
+    from ..data.model import Step, Trace
+    from ..data.model import Trace as TraceType
+    from ..review.answers import Answers
+    from ..review.catalogue import Question
+
+FORMAT = "atif-scan-viewer/1"
+ASSETS = ("index.html", "viewer.css", "evidence.js", "viewer.js")
+SHARED_ASSETS = ("tokens.css",)  # from the browser package, shared with --browse
+DATA_FILE = "data.js"
+TRIALS_DIR = "trials"  # --viewer-split: one steps file per trial, loaded when opened
+MAX_NAME = 60
+WEB_GAPS = "integrity.web_results_not_recorded"
+TRIAL_KEYS = ("input_id", "task", "reward", "input_status", "severity", "score")
+# Per-trial run facts, all allowlisted report fields (labels, counts, amounts).
+FACT_KEYS = (
+    "agent_name",
+    "agent_version",
+    "model_name",
+    "error_type",
+    "input_tokens",
+    "cache_tokens",
+    "output_tokens",
+    "cost_usd",
+    "duration_sec",
+    "agent_duration_sec",
+    "llm_calls",
+    "agent_steps",
+    "tool_calls",
+    "context_compactions",
+    "stream_retry_attempts",
+    "termination_error",
+    "final_stop_reason",
+    "setup_duration_sec",
+    "verifier_duration_sec",
+    "failed_phase",
+    "safety_provider",
+    "safety_reason",
+    "safety_category",
+)
+COVERAGE_KEYS = ("incomplete", "coverage_gaps", "recording_gaps", "input_error")
+# --run/--release lineage: whether the trial counts, and what it replaced (codes, names).
+SELECTION_KEYS = (
+    "role",
+    "id",
+    "replaced_trial",
+    "replaced_error",
+    "failure_phase",
+    "replaced_by",
+    "replacement_trial",
+    "supersedes",
+    "state",
+)
+
+
+def _name(value: str, known: frozenset[str]) -> str:
+    """A tool name is trace text: masked, single-line and bounded like any label."""
+    text = " ".join(mask(value, known).split())
+    return text if len(text) <= MAX_NAME else text[: MAX_NAME - 1] + "…"
+
+
+def _label(step: Step, location: Doc, known: frozenset[str], provenance: Doc) -> str:
+    part, index = as_str(location["part"]), location["index"]
+    if part in ("message", "reasoning"):
+        return part
+    if part == "result":
+        source = provenance.get("source_call_index")
+        return f"result {index}" + (f" · call {source}" if source is not None else "")
+    call = step.calls[index]
+    name = _name(call.name, known) or call.tool
+    if part == "call_info":
+        return f"call {index} · {name} · call record"
+    return f"call {index} · {name} · {provenance.get('channel', 'argument')}"
+
+
+def _wanted(step: Step, location: Doc, status: str, targeted: bool) -> bool:
+    """Hide only empty message/reasoning slots and redundant call records."""
+    if targeted:
+        return True
+    if location["part"] == "call_info":
+        call = step.calls[location["index"]]
+        return not any(c.understood or c.text or c.media for _, c in call.fields)
+    return status != "empty_or_absent"
+
+
+def _field(step: Step, location: Doc, known: frozenset[str]) -> Doc:
+    content, provenance = _segment_content(
+        step, location["part"], location["index"], location["field"]
+    )
+    return {
+        **{key: location[key] for key in ("part", "index", "field")},
+        "label": _label(step, location, known, provenance),
+        "status": _segment_status(content, location["part"]),
+        "text": mask(content.text, known),
+        **provenance,
+    }
+
+
+def _steps(
+    trace: Trace, targeted: list[Doc], known: frozenset[str], wanted: set[int] | None = None
+) -> list[Doc]:
+    by_number = dict(zip(trace.step_numbers, trace.steps, strict=True))
+    shown: dict[int, list[Doc]] = {n: [] for n in by_number if wanted is None or n in wanted}
+    for location, _ in fields(trace):
+        if location["step"] not in shown:
+            continue
+        step = by_number[location["step"]]
+        field = _field(step, location, known)
+        if _wanted(step, location, field["status"], location in targeted):
+            shown[location["step"]].append(field)
+    return [
+        {"step": n, "role": by_number[n].source, "fields": values} for n, values in shown.items()
+    ]
+
+
+def _focus(trace: Trace, item: Doc, finding: Doc, location: Doc, known: frozenset[str]) -> Doc:
+    if location["step"] not in trace.step_numbers:
+        return {"focus_status": "unlocated", "highlight_start": None, "highlight_end": None}
+    step = trace.steps[trace.step_numbers.index(location["step"])]
+    try:
+        content, _ = _segment_content(step, location["part"], location["index"], location["field"])
+    except ValueError:
+        return {"focus_status": "unlocated", "highlight_start": None, "highlight_end": None}
+    span = first_span(item, finding, location) if location["part"] != "call_info" else None
+    return masked_focus(content.text, span, known)
+
+
+def _trial_findings(
+    trace: Trace | None, item: Doc, report: Doc, known: frozenset[str], full: bool
+) -> list[Doc]:
+    found = [f for f in findings(item) if full or f["severity"] != "info" or f["status"] != "match"]
+    apply_titles(found, report)
+    for finding in found:
+        if trace is not None:
+            if finding["check_id"] == WEB_GAPS and finding["status"] == "match":
+                finding["web_gaps"] = web_gap_details(trace, finding["locations"])
+            finding["locations"] = [
+                {**loc, **_focus(trace, item, finding, loc, known)} for loc in finding["locations"]
+            ]
+        del finding["_identity"]
+    return found
+
+
+def trial_bundle(
+    trial_id: str,
+    item: Doc,
+    trace: Trace | None,
+    report: Doc,
+    reasons: Mapping[str, str] | None = None,
+    *,
+    full: bool = False,
+) -> Doc:
+    """One trial: allowlisted scan fields, findings with proven highlights, masked steps,
+    and judge answers with their reasons (`reasons`) masked like the steps. By default,
+    omit informational matches and unrelated steps; `full` retains the chronology."""
+    known = trace_secrets(trace) if trace is not None else frozenset()
+    found = _trial_findings(trace, item, report, known, full)
+    targeted = _targeted_fields(found)
+    rows = answer_rows(item, reasons, known)
+    wanted = None if full else _related_steps(targeted, rows)
+    steps = _steps(trace, targeted, known, wanted) if trace is not None else []
+    return deepcopy(
+        {
+            "id": trial_id,
+            **{key: item.get(key) for key in TRIAL_KEYS},
+            "coverage": {key: item.get(key) for key in COVERAGE_KEYS},
+            "facts": {key: item.get(key) for key in FACT_KEYS},
+            "selection": {
+                key: value
+                for key in SELECTION_KEYS
+                if (value := as_object(item.get("selection")).get(key)) is not None
+            },
+            "findings": found,
+            "answers": rows,
+            "steps": steps,
+        }
+    )
+
+
+def _targeted_fields(found: list[Doc]) -> list[Doc]:
+    targeted = [
+        {key: loc[key] for key in ("step", "part", "index", "field")}
+        for finding in found
+        for loc in finding["locations"]
+    ]
+    targeted += [
+        {key: u["location"][key] for key in ("step", "part", "index", "field")}
+        for finding in found
+        for u in finding["unread"]
+        if u["location"] is not None
+    ]
+    targeted += [
+        gap[key]
+        for finding in found
+        for gap in finding.get("web_gaps", [])
+        for key in ("call_location", "result_location")
+        if gap.get(key) is not None
+    ]
+    return targeted
+
+
+def _related_steps(targeted: list[Doc], answers: list[Doc]) -> set[int]:
+    """Whole steps, including unread/web-gap evidence and judge citations."""
+    return {loc["step"] for loc in targeted} | {
+        step for row in answers for step in row.get("steps", [])
+    }
+
+
+def run_facts(b: Doc) -> Doc:
+    """Run headline numbers from the brief document, plus its sections as text lines.
+
+    Only these fields leave the brief: harness/model rows, job names, trial and score
+    counts, token totals, walltime and cost amounts with their basis. Sections are the
+    brief's own scanner-written lines (counts, labels, check names; never trace text).
+    """
+    ov, ce, scoped = b["overview"], b["cost_estimate"], b.get("scoped_costs") or {}
+    return {
+        "harness": [
+            {key: row.get(key) for key in ("agent", "version", "model", "trials")}
+            for row in b.get("agent_rows") or []
+        ],
+        "jobs": [r.get("job_name") or r.get("job_id") for r in b.get("runs") or []],
+        "trials": {key: ov["trials"].get(key) for key in ("present", "planned", "errored")},
+        "accuracy": ov.get("accuracy"),
+        "tokens": dict(ce.get("tokens") or {}),
+        "walltime": {
+            "agent_sec": ov["walltime"]["agent"]["seconds"],
+            "trial_sec": ov["walltime"]["trial"]["seconds"],
+            "recorded_trials": ov["walltime"]["agent"]["recorded_trials"],
+        },
+        "cost": {
+            "recorded_usd": ov["cost"].get("total_usd"),
+            "without_cost": ov["cost"].get("missing"),
+            "estimate_usd": ce.get("estimate_usd"),
+            "estimate_source": ce.get("price_source"),
+            "estimate_method": ce.get("method"),
+            "rates_per_mtok": ce.get("rates_per_mtok"),
+            "observed_usd": scoped.get("estimated_observed_cost_usd"),
+            "observed_trials": scoped.get("trials"),
+        },
+        "selection": {
+            key: (b.get("selection") or {}).get(key)
+            for key in ("kind", "name", "pending", "not_counted", "as_run_accuracy")
+        }
+        if b.get("selection")
+        else None,
+        "sections": sections(b),
+    }
+
+
+# --- review mode: a blind human-review export ----------------------------------------
+
+REVIEW_FORMAT = "atif-scan-review/1"
+REVIEW_CHECK = "review.candidates"
+
+
+def _candidates(question: Question, trace: TraceType) -> Doc | None:
+    """The question's review targets as one assessment, so the viewer's receipts jump to
+    them with proven highlights. Candidates, never findings: no priority, not scored."""
+    targets = question.review_targets(trace) if question.review_targets else []
+    if not targets:
+        return None
+    numbers = trace.step_numbers
+    evidence = [
+        {
+            "step": at.step,
+            "step_id": numbers[at.step],
+            "channel": at.channel.value,
+            "call": at.call,
+            "observation": at.observation,
+            "field": at.field,
+            "span": list(at.span) if at.span else None,
+        }
+        for at in targets
+    ]
+    return {
+        "id": REVIEW_CHECK,
+        "kind": "detector",
+        "version": question.version,
+        "severity": "info",
+        "status": "match",
+        "evidence": evidence,
+        "unread": [],
+        "measure": {"candidates": len(evidence)},
+        "expected_by": [],
+    }
+
+
+def blind_item(item: Doc, question: Question, trace: TraceType | None) -> Doc:
+    """A report item with the scanner's view removed (findings, priority, score, the
+    checks left unknown) and the question's candidates in their place."""
+    candidates = _candidates(question, trace) if trace is not None else None
+    return {
+        **item,
+        "assessments": [candidates] if candidates else [],
+        "severity": None,
+        "score": None,
+        "coverage_gaps": None,
+    }
+
+
+def review_block(question: Question) -> Doc:
+    """What the reviewer is asked: the question's own text and closed answer sets, and a
+    random export ID that binds saved verdicts to this export."""
+    return {
+        "format": REVIEW_FORMAT,
+        "export_id": secrets.token_hex(8),
+        "question": question.id,
+        "version": question.version,
+        "title": question.title,
+        "ask": question.ask,
+        "answers": dict(question.answers),
+        "mechanisms": dict(question.mechanisms),
+        # Answers a mechanism describes; the others take "none".
+        "positive": [a for a in question.answers if a not in (*UNIVERSAL, "unclear")],
+        "candidates": question.evidence_label if question.review_targets else None,
+        "guide": [{"heading": h, "points": list(points)} for h, points in question.review_guide],
+    }
+
+
+def _review_trial(trial: Doc, question: Question) -> Doc:
+    for finding in trial["findings"]:
+        if finding["check_id"] == REVIEW_CHECK:
+            finding["title"] = question.evidence_label
+            finding["category"] = "behaviour"
+    return trial
+
+
+def _trial(
+    trial_id: str,
+    item: Doc,
+    trace: TraceType | None,
+    report: Doc,
+    review: Question | None,
+    reasons: Mapping[str, str] | None = None,
+    *,
+    full: bool = False,
+) -> Doc:
+    if review is None:
+        return trial_bundle(trial_id, item, trace, report, reasons, full=full)
+    trial = trial_bundle(trial_id, blind_item(item, review, trace), trace, report, full=True)
+    trial["answers"] = []  # blind: never a judge's answer
+    return _review_trial(trial, review)
+
+
+def bundle(
+    records: list[Record],
+    items: list[Doc],
+    digests: list[str | None],
+    report: Doc,
+    run: Doc | None = None,
+    review: Question | None = None,
+    answers: Answers | None = None,
+    *,
+    full: bool = False,
+) -> Doc:
+    """The whole export document. Traces are re-read only when still matching their pin.
+    `review`: a blind human-review export for that question (no findings, scores or
+    scanner run sections; the question's candidates to jump between). `answers`: the
+    loaded bundle, for each answer's masked reason (never in a blind export).
+    `full`: retain info matches and unrelated steps; blind exports are always full."""
+    if not len(records) == len(items) == len(digests):
+        raise ValueError("record_item_count_mismatch")
+    trials = []
+    for number, ((source, _), item, sha256) in enumerate(zip(records, items, digests, strict=True)):
+        if source.label != item.get("input_id"):
+            raise ValueError("record_item_mismatch")
+        trace = None
+        if item.get("input_status") == "available":
+            trace = load_bytes(pinned_bytes(source.local, sha256))
+        reasons = answers.reasons_for(source.label) if answers is not None else None
+        trials.append(_trial(str(number), item, trace, report, review, reasons, full=full))
+    document = {
+        "format": FORMAT,
+        "evidence_scope": "full" if full or review is not None else "findings",
+        "scanner_version": report.get("scanner_version"),
+        "packs": deepcopy(report.get("packs")),
+        "run": deepcopy(run),
+        "trials": trials,
+        # Wording for the judge answers shown (none in a blind review export).
+        "questions": question_labels(items) if review is None else {},
+    }
+    if review is not None:
+        document["review"] = review_block(review)
+        if document["run"]:
+            document["run"]["sections"] = []  # the scanner's own run brief: not blind
+    return document
+
+
+def data_script(document: Doc, name: str = "ATIF_VIEWER") -> str:
+    """ASCII-only JSON assigned to one global; `<` escaped so no markup survives."""
+    text = json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    return f"window.{name} = " + text.replace("<", "\\u003c") + ";\n"
+
+
+def split(document: Doc) -> dict[str, str]:
+    """Move each trial's steps into its own script, loaded only when the trial is opened, so
+    a full-chronology export of a large run stays light: {relative path: script}. The
+    document keeps every summary, finding and fact; each trial gains `steps_file`."""
+    files = {}
+    for trial in document["trials"]:
+        name = f"{TRIALS_DIR}/{int(trial['id'])}.js"  # numeric ids only: never a path from data
+        steps = trial.pop("steps")
+        text = json.dumps(steps, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        files[name] = (
+            f"window.ATIF_VIEWER_STEPS({json.dumps(trial['id'])}, "
+            + text.replace("<", "\\u003c")
+            + ");\n"
+        )
+        trial["steps_file"] = name
+    return files
+
+
+def _writable(directory: Path) -> None:
+    if directory.is_symlink() or (
+        directory.exists() and (not directory.is_dir() or any(directory.iterdir()))
+    ):
+        raise ValueError("viewer_directory_not_empty")
+
+
+def write(
+    directory: Path,
+    document: Doc,
+    folder: str = "viewer",
+    assets: tuple[str, ...] = ASSETS,
+    global_name: str = "ATIF_VIEWER",
+    *,
+    split_steps: bool = False,
+) -> None:
+    """A new or empty directory, private until the reviewer publishes it themselves: the
+    `folder`'s fixed `assets`, the shared tokens, and the document as `data.js` (with
+    `split_steps`, each trial's steps in `trials/<id>.js`)."""
+    _writable(directory)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    shards = split(document) if split_steps else {}
+    if shards:
+        (directory / TRIALS_DIR).mkdir(mode=0o700)
+    package = resources.files("atif_scan.browser")
+    static = package.joinpath(folder)
+    files = {name: static.joinpath(name).read_text(encoding="utf-8") for name in assets}
+    files.update(
+        {name: package.joinpath(name).read_text(encoding="utf-8") for name in SHARED_ASSETS}
+    )
+    files[DATA_FILE] = data_script(document, global_name)
+    files.update(shards)
+    for name, text in files.items():
+        fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)

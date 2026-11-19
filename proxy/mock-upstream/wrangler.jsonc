@@ -1,0 +1,9 @@
+// Staging-only mock upstream (§9.4); never part of a production deployment.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "saferagents-mock-upstream",
+  "main": "worker.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": false,
+}

@@ -1,0 +1,31 @@
+[tools]
+node = "26.13.1"
+python = "3.14.10"
+uv = "0.13.9"
+
+[tasks.install]
+description = "Install dependencies for both workers"
+run = ["npm --prefix proxy ci", "uv sync --project scanner --all-groups"]
+
+[tasks.lint]
+description = "Lint and typecheck both workers"
+run = [
+  "cd proxy && npm run lint",
+  "cd scanner && uv run ruff check && uv run ruff format --check",
+  "node proxy/scripts/spec-sync.ts --check",
+]
+
+[tasks.format]
+description = "Format both workers"
+run = ["cd proxy && npm run format", "cd scanner && uv run ruff check --fix && uv run ruff format"]
+
+[tasks.spec]
+description = "Refresh spec.md code listings from the sources"
+run = "node proxy/scripts/spec-sync.ts"
+
+[tasks.test]
+description = "Run both workers' tests"
+run = ["cd proxy && npm test", "cd scanner && uv run pytest -q"]
+
+[env]
+UV_PYTHON_PREFERENCE = "system"  # prefer the pinned Python; pywrangler still fetches Pyodide

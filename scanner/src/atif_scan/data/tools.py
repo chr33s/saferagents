@@ -1,0 +1,697 @@
+"""Tool calls: harness tool names normalised to categories (hints, not proof of what ran),
+and argument values classified into channels (command, path, query, URL, payload).
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping
+from typing import TypeGuard
+
+from . import jslit, pylit
+from .content import content
+from .jsonval import JsonObject, as_list, as_object, is_object
+from .model import Channel, Content
+
+# Tool categories observed in real agent exports. Extend with a regression test per alias.
+TOOLS = {
+    "shell": {
+        "bash",
+        "Bash",
+        "shell",
+        "Shell",
+        "exec",
+        "execute",
+        "execute_command",
+        "run_command",
+        "run_script",
+        "run_shell_command",
+        "terminal",
+    },
+    "read": {"read_text_file", "read_file", "read", "Read", "view_file"},
+    "write": {
+        "write_text_file",
+        "write_file",
+        "write",
+        "Write",
+        "edit",
+        "Edit",
+        "edit_text",
+        "edit_file",
+        "str_replace",
+    },
+    "search_files": {"grep", "Grep", "glob", "Glob", "find_file_by_name", "list_files"},
+    "web_fetch": {"web_fetch", "fetch_url", "webfetch", "WebFetch", "fetch"},
+    "web_search": {"web_search", "web_search_preview", "WebSearch"},
+    # Orchestration tools whose arguments carry no command/path/URL evidence.
+    # ToolSearch is Claude Code's deferred-tool registry lookup, not a web search.
+    "inert": {
+        "todo_write",
+        "TodoWrite",
+        "get_output",
+        "kill_shell",
+        "service_status",
+        "ToolSearch",
+    },
+}
+# Harness-specific names, one table per harness (extend with a regression test).
+HARNESS_ALIASES = {
+    # Kimi Code.
+    "FetchURL": "web_fetch",
+    "TodoList": "inert",
+    # Cursor CLI (cursor-cli), seen on the TB2.1 leaderboard.
+    "shellToolCall": "shell",
+    "readToolCall": "read",
+    "editToolCall": "write",
+    "writeToolCall": "write",
+    "deleteToolCall": "write",
+    "grepToolCall": "search_files",
+    "globToolCall": "search_files",
+    "webFetchToolCall": "web_fetch",
+    "webSearchToolCall": "web_search",
+    "awaitToolCall": "inert",
+    "updateTodosToolCall": "inert",
+    # Devin CLI, seen on the TB2.1 leaderboard: text typed into an interactive shell.
+    "write_to_process": "shell",
+    # Ouroboros, seen on the TB2.1 leaderboard.
+    "start_service": "shell",
+    "search_code": "search_files",
+    "query_code": "search_files",
+    "view_image": "read",
+    "ocr_pdf": "read",
+    "stop_service": "inert",
+    "service_logs": "inert",
+    "wait_tasks": "inert",
+    "verify_and_record": "inert",
+    "task_acceptance_review": "inert",
+    "schedule_subagent": "inert",
+    "skill": "inert",  # Devin CLI skill invocation (generic skills, name + subcommand)
+    # Codex CLI.
+    "exec_command": "shell",
+    "write_stdin": "shell",
+    "apply_patch": "write",
+    "update_plan": "inert",
+    "update_goal": "inert",  # Codex goal mode: a status ("complete"), like update_plan
+    "wait": "inert",
+    # Terminus 2.
+    "bash_command": "shell",
+    "mark_task_complete": "inert",
+    # fast-agent.
+    "process": "inert",
+    "attach_media": "read",
+    # Linghun.
+    "ReadSnippets": "read",
+    "MultiEdit": "write",
+    "SourcePack": "search_files",
+    "Diff": "read",
+    "Todo": "inert",
+    "GitStatusInspect": "inert",
+    "RunVerification": "inert",
+    # Claude Code task tools.
+    "TaskCreate": "inert",
+    "TaskUpdate": "inert",
+    "TaskStop": "inert",
+    # LemonCrow (Claude Code MCP tools), seen on the TB2.1 leaderboard.
+    "mcp__lc__bash": "shell",
+    "mcp__lc__read": "read",
+    "mcp__lc__edit": "write",
+    "mcp__lc__code_search": "search_files",
+    # Surf harness (nano-grok-build), seen on the TB2.1 leaderboard.
+    "run_terminal_command": "shell",
+    "search_replace": "write",
+    "list_dir": "search_files",
+    "get_terminal_command_output": "inert",
+    "kill_terminal_command": "inert",
+    # AiWork.Coder (dtcoder).
+    "background_exec": "shell",
+    "plan": "inert",
+    "read_tool_result_page": "inert",
+    # Gemini CLI.
+    "replace": "write",
+    "grep_search": "search_files",
+    "list_directory": "search_files",
+    "update_topic": "inert",
+    "google_web_search": "web_search",
+    "read_background_output": "inert",
+    "list_background_processes": "inert",
+    # indusagi.
+    "ls": "search_files",
+    "find": "search_files",
+    # Dext.
+    "rg": "search_files",
+    "fd": "search_files",
+    "read_symbol": "read",
+    "multi_edit": "write",
+    "http": "web_fetch",
+    "git_diff": "read",
+    "git_log": "read",
+    # File inspection with arguments rather than a path (a `read` needs a path).
+    "awk": "search_files",
+    "jq": "search_files",
+    "csvkit": "search_files",
+    "todo_read": "inert",
+    # Mobile Coder.
+    "pdf_parse": "read",
+    "todowrite": "inert",
+    "invalid": "inert",
+    # WorkHarness.
+    "tool_search": "inert",
+    "image_to_text": "read",
+    "task_output": "inert",
+    "task_get": "inert",
+    "task_stop": "inert",
+    "sleep": "inert",
+    # OrcaTerm: completion reports (prose summaries, not written files).
+    "goal_complete": "inert",
+    "goal_blocked": "inert",
+    # SLAI Agent Runtime's tb_bridge (a TB2.1 submission): a CLI relaying a host-side
+    # client's actions into the sandbox. `task` returns the instruction, `upload` copies a
+    # host file in (`host_path`), `finalize` reports a summary. exec/write/read/ls resolve
+    # through their namespace (see `NAMESPACE`).
+    "tb_bridge.task": "inert",
+    "tb_bridge.upload": "write",
+    "tb_bridge.finalize": "inert",
+}
+ALIASES = {name: category for category, names in TOOLS.items() for name in names}
+ALIASES.update(HARNESS_ALIASES)
+
+# Tool categories are *hints*: they name what a tool does (so e.g. only a known web-search
+# tool counts as a web search) and which evidence must be present. Evidence extraction
+# itself is generic and applies to every call; see `classify`.
+REQUIRED = {
+    "shell": Channel.COMMAND,
+    "read": Channel.PATH,
+    "write": Channel.PATH,
+    "web_fetch": Channel.URL,
+    "web_search": Channel.QUERY,
+}
+
+
+def _keys(*names: str) -> frozenset[str]:
+    return frozenset(names)
+
+
+# Argument key conventions (compared lowercased, without `_`/`-`), not tool names.
+COMMAND_KEYS = _keys(
+    "command",
+    "cmd",
+    "commands",
+    "script",
+    "shellcommand",
+    "bash",
+    "code",
+    # Text typed into a terminal: Devin text_input, Terminus keystrokes, Codex write_stdin.
+    "textinput",
+    "keystrokes",
+    "chars",
+)
+TERMINAL_INPUT_KEYS = _keys("textinput", "keystrokes", "chars")
+QUERY_KEYS = _keys("query", "q", "searchquery", "searchterm", "queries")
+URL_KEYS = _keys("url", "urls", "uri", "href", "link", "endpoint")
+PATH_KEYS = _keys(
+    "targetdirectory",
+    "path",
+    "paths",
+    "filepath",
+    "file",
+    "files",
+    "filename",
+    "dir",
+    "directory",
+    "cwd",
+    "workdir",
+    "workingdirectory",
+    "source",
+    "src",
+    "target",
+    "destination",
+    "dest",
+    "output",
+    "outputpath",
+    "root",
+    "notebookpath",
+)
+PAYLOAD_KEYS = _keys(
+    "bytesinput",
+    "input",  # Codex apply_patch
+    "globpattern",
+    "streamcontent",
+    "content",
+    "contents",
+    "text",
+    "body",
+    "data",
+    "newstring",
+    "newstr",
+    "newtext",
+    "insertline",
+    "patch",
+    "diff",
+    "edits",
+    "description",
+    "prompt",
+    "message",
+    "messages",
+    "instructions",
+    "note",
+    "notes",
+    "todos",
+    "summary",
+    "reasoning",
+    "thought",
+    "explanation",
+    "title",
+    "pattern",
+    "regex",
+    "glob",
+    "include",
+    "exclude",
+)
+# Existing text an edit quotes (not authored by the agent): not evidence of anything.
+QUOTED_KEYS = _keys("oldstring", "oldstr", "oldtext", "original", "search", "find")
+URL_VALUE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+PATH_VALUE = re.compile(r"(?:/|~/|\./|\.\./|[A-Za-z]:[\\/])[^\n]{0,4095}")
+
+
+# Codex CLI records its hosted web tool as one name whose `action_type` says what it did.
+ACTION_TOOLS = {
+    "web_search_call": {
+        "search": "web_search",
+        "open_page": "web_fetch",
+        "find_in_page": "web_fetch",
+    },
+    # OpenHands exposes read and write operations through one editor tool.
+    "file_editor": {
+        "view": "read",
+        "create": "write",
+        "str_replace": "write",
+        "insert": "write",
+        "undo_edit": "write",
+    },
+    "task_tracker": {"view": "inert", "plan": "inert"},
+}
+ACTION_KEYS = {"file_editor": "command", "task_tracker": "command"}
+# These are model-authored prose, not executable actions. Preserve their text in its
+# own channel rather than dropping it with orchestration arguments. A tool's thought
+# is not evidence that provider-internal reasoning was exported in full.
+PROSE_TOOLS = {
+    "think": ("thought", Channel.REASONING),
+    "finish": ("message", Channel.MESSAGE),
+    # Codex goal mode: the goal the agent sets itself, in its own words.
+    "create_goal": ("objective", Channel.MESSAGE),
+}
+
+
+def _prose_tool(name: str, args: object) -> bool:
+    key, _ = PROSE_TOOLS[name]
+    return is_object(args) and not (set(args) - {key, "kind"}) and isinstance(args.get(key), str)
+
+
+# Non-JSON ("freeform") tools take raw text rather than an object: Responses custom
+# tools, Codex apply_patch, fast-agent's raw-command shell. Exporters record that text as
+# the whole `arguments` string or as a lone `input` field. It is routed by the tool's
+# kind, not by the field name; kinds without a natural channel keep it as a payload.
+RAW_INPUT_KEY = "input"
+RAW_INPUT_CHANNEL = {
+    "shell": Channel.COMMAND,
+    "read": Channel.PATH,
+    "write": Channel.PAYLOAD,
+    "web_fetch": Channel.URL,
+    "web_search": Channel.QUERY,
+}
+
+
+def raw_input(args: object) -> str | None:
+    """The raw text of a non-JSON tool call, or None for structured arguments."""
+    if isinstance(args, str):
+        return args
+    if isinstance(args, dict) and set(args) == {RAW_INPUT_KEY}:
+        value = args[RAW_INPUT_KEY]
+        return value if isinstance(value, str) else None
+    return None
+
+
+# fast-agent programmatic tool calling: one freeform tool whose raw `input` is a Python
+# program calling the agent's other tools as functions (`await shell(command="ls")`).
+# fast-agent named its PTC code tool execute_python until 0.10.52, exec_sandbox since.
+PYTHON_PROGRAM_TOOLS = frozenset({"execute_python", "exec_sandbox"})
+
+
+# Tool functions a program tool declares, by its name (see `declared_program_tools`).
+Declared = Mapping[str, frozenset[str]]
+# fast-agent lists them in the tool's description: "Available functions:" then a fenced
+# block of `async def NAME(*, …) -> …:` stubs.
+_AVAILABLE = re.compile(r"^Available functions:\s*```python\n(.*?)^```", re.M | re.S)
+_STUB = re.compile(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.M)
+
+
+def declared_program_tools(agent: object) -> dict[str, frozenset[str]]:
+    """The tool functions each program tool in `agent.tool_definitions` says programs can
+    call. A tool whose description lists none is left out (every call stays a possible
+    tool call). Only names are kept."""
+    found: dict[str, frozenset[str]] = {}
+    for definition in as_list(as_object(agent).get("tool_definitions")):
+        function = as_object(as_object(definition).get("function"))
+        name, text = function.get("name"), function.get("description")
+        block = _AVAILABLE.search(text) if isinstance(text, str) else None
+        names = frozenset(_STUB.findall(block.group(1))) if block else frozenset()
+        if isinstance(name, str) and name in PYTHON_PROGRAM_TOOLS and names:
+            found[name] = names
+    return found
+
+
+def program_calls(
+    name: str, args: object, declared: Declared | None = None
+) -> list[tuple[str, object]] | None:
+    """Tool calls inside a tool program, or None when this isn't one: Codex code mode
+    (`exec` with a JavaScript `input`, see `jslit`) or fast-agent's `execute_python` (see
+    `pylit`). Read statically, never run."""
+    if name in PYTHON_PROGRAM_TOOLS:
+        return _python_calls(name, args, declared)
+    if name != "exec" or not isinstance(args, dict) or set(args) - {"input", "timeout_ms"}:
+        return None
+    program = args.get("input")
+    if not isinstance(program, str) or not jslit.CALL.search(program):
+        return None
+    return jslit.tool_calls(program)
+
+
+def python_program_source(args: object) -> str | None:
+    """Known Python wrappers: freeform input or the exact structured ``code`` shape.
+
+    Do not reinterpret arbitrary tools' code payloads or choose between ambiguous keys.
+    """
+    if isinstance(args, dict) and set(args) == {"code"}:
+        value = args["code"]
+        return value if isinstance(value, str) else None
+    return raw_input(args)
+
+
+def _python_calls(
+    name: str, args: object, declared: Declared | None
+) -> list[tuple[str, object]] | None:
+    program = python_program_source(args)
+    if program is None:
+        return None
+    return pylit.tool_calls(program, (declared or {}).get(name), _harness_tool)
+
+
+def _harness_tool(name: str) -> bool:
+    """A recognized tool name (a Python program's other uses of one are unknown)."""
+    return _normalize_action(name, None) != "other"
+
+
+def program_fields(
+    args: object, name: str = "exec", calls: list[tuple[str, object]] | None = None
+) -> tuple[Field, ...]:
+    """A tool program's own constants beyond the arguments read as its calls (see
+    `jslit.program_strings`, `pylit.program_strings`): one unclassified argument field per
+    literal, read wherever commands are, so a command held in a constant (`const cmds =
+    [...]`, `cmds = [...]`) is still seen."""
+    if name in PYTHON_PROGRAM_TOOLS:
+        program = python_program_source(args)
+    else:
+        program = args.get("input") if isinstance(args, dict) else raw_input(args)
+    if not isinstance(program, str):
+        found: list[str] = []
+    elif name in PYTHON_PROGRAM_TOOLS:
+        read = {text for _, argument in calls or () for text in pylit.strings(argument)}
+        found = pylit.program_strings(program, read)
+    else:
+        found = jslit.program_strings(program)
+    literals = tuple((Channel.ARGUMENTS, content(text)) for text in found)
+    # Private inspection needs the entire program, not just its extracted literals.
+    # Keep it a payload: predicates must not treat quoted edits as executed commands.
+    source = (
+        ((Channel.PAYLOAD, content(program)),)
+        if name in PYTHON_PROGRAM_TOOLS and isinstance(program, str)
+        else ()
+    )
+    return literals + source
+
+
+def computed_fields(tool: str) -> tuple[Field, ...]:
+    """A tool-program call whose whole argument is computed (`tools.apply_patch(p)` with
+    `p` built at runtime): its required field, unreadable but computed."""
+    return ((REQUIRED.get(tool, Channel.ARGUMENTS), Content(understood=False, computed=True)),)
+
+
+def program_tool(name: str, args: object) -> str:
+    # Codex's hosted web tool inside code mode: `{search_query: [{q}]}` or `{open: [...]}`.
+    if name in ("web__run", "web.run"):
+        keys = set(args) if isinstance(args, dict) else set()
+        if "search_query" in keys:
+            return "web_search"
+        return "web_fetch" if keys & {"open", "click", "find"} else "other"
+    if name in NO_INPUT_TOOLS and args is None:
+        return "inert"  # `tools.clock__curr_time()`: called with no argument at all
+    return normalize_tool(name, args if isinstance(args, dict) else None)
+
+
+# Tools that only read harness state and take no input, so an empty call can carry no
+# command, path, URL or text. Inert only when called with nothing: any argument stays
+# unknown. Codex code mode's clock: 1,540 `tools.clock__curr_time({})` calls in one TB4
+# job each left every input check unknown; Codex goal mode's `get_goal({})` likewise.
+NO_INPUT_TOOLS = frozenset({"clock__curr_time", "get_goal"})
+
+
+def normalize_tool(name: str, args: object = None) -> str:
+    if name in ("web__run", "web.run"):
+        return program_tool(name, args)
+    return "inert" if _idle_call(name, args) else _normalize_action(name, args)
+
+
+def _idle_call(name: str, args: object) -> bool:
+    """A call that, with these arguments, sends nothing anywhere."""
+    if not isinstance(args, Mapping):
+        return False
+    if name == "write_stdin":
+        return not args.get("chars")  # Codex polling a running session: nothing was typed
+    if name == "background_exec":
+        # dtcoder waiting on/stopping/listing a background task: nothing ran
+        return not args.get("command")
+    return name in NO_INPUT_TOOLS and not args
+
+
+# A namespaced tool name (`tb_bridge.exec`, `functions:read`, `mcp__server__bash`): its
+# last part is the tool, when the whole name isn't a known one.
+NAMESPACE = re.compile(r"^[A-Za-z_][\w-]*(?:\.|:|__)(\w+)$")
+
+
+def _normalize_action(name: str, args: object) -> str:
+    if name in PROSE_TOOLS:
+        return "inert" if _prose_tool(name, args) else "other"
+    actions = ACTION_TOOLS.get(name)
+    if actions is not None:
+        key = ACTION_KEYS.get(name, "action_type")
+        action = args.get(key) if is_object(args) else None
+        return actions.get(action, "other") if isinstance(action, str) else "other"
+    if name in ALIASES:
+        return ALIASES[name]
+    namespaced = NAMESPACE.match(name)
+    return ALIASES.get(namespaced.group(1), "other") if namespaced else "other"
+
+
+def _norm(key: str | None) -> str:
+    return re.sub(r"[_\-\s]", "", key.lower()) if key else ""
+
+
+def types_into_terminal(arguments: Mapping[str, object] | None) -> bool:
+    """The call types text into a terminal (a top-level keystrokes-style argument), so its
+    output is whatever the terminal shows next, not a result of its own."""
+    return arguments is not None and any(_norm(k) in TERMINAL_INPUT_KEYS for k in arguments)
+
+
+def leaves(value: object, key: str | None = None) -> Iterator[tuple[str | None, object]]:
+    """(nearest key, value) for every non-dict/list leaf; list items inherit their key."""
+    if isinstance(value, dict):
+        for k, v in as_object(value).items():
+            yield from leaves(v, k)
+    elif isinstance(value, list):
+        value = as_list(value)
+        if _norm(key) in COMMAND_KEYS:
+            # argv form, e.g. ["bash", "-lc", "..."]; mixed lists are not understood.
+            yield key, " ".join(value) if argv(value) else value
+            return
+        for v in value:
+            yield from leaves(v, key)
+    else:
+        yield key, value
+
+
+def argv(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and bool(value) and all(isinstance(v, str) for v in value)
+
+
+# Key conventions checked after the value shape, in order (see `classify`).
+KEY_CHANNELS = (
+    (COMMAND_KEYS, Channel.COMMAND),
+    (QUERY_KEYS, Channel.QUERY),
+    (URL_KEYS, Channel.URL),
+    (PATH_KEYS, Channel.PATH),
+)
+
+
+def classify(key: str | None, value: str) -> tuple[Channel, str]:
+    """Route one argument string by key convention and value shape (see design.md)."""
+    k = _norm(key)
+    if k in PAYLOAD_KEYS:
+        return Channel.PAYLOAD, value
+    if value.startswith("file://"):
+        return Channel.PATH, value[len("file://") :]
+    return _value_channel(k, value), value
+
+
+def _value_channel(k: str, value: str) -> Channel:
+    if URL_VALUE.fullmatch(value):
+        return Channel.URL
+    by_key = next((channel for keys, channel in KEY_CHANNELS if k in keys), None)
+    if by_key is not None:
+        return by_key
+    return Channel.PATH if PATH_VALUE.fullmatch(value) else Channel.ARGUMENTS
+
+
+# Codex apply_patch envelope: the file paths live inside the patch text.
+PATCH_ENVELOPE = re.compile(r"^\*\*\* Begin Patch\b", re.M)
+# Greedy to the line end, then rstrip(): a lazy `(\S.*?)\s*$` retries `\s*$` at every
+# character (quadratic on long lines).
+PATCH_PATHS = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): *(\S.*)$", re.M)
+
+
+Field = tuple[Channel, Content]
+
+
+def call_fields(tool: str, args: object, *, name: str = "") -> tuple[Field, ...]:
+    """Generic evidence extraction, with explicit adapters for overloaded tool fields."""
+    if name == "file_editor":
+        return _editor_fields(tool, args)
+    if name in PROSE_TOOLS and tool == "inert":
+        key, channel = PROSE_TOOLS[name]
+        return ((channel, content(as_object(args).get(key))),)
+    fields = _generic_call_fields(tool, args)
+    if name in (PROSE_TOOLS.keys() | ACTION_KEYS.keys()) and tool == "other":
+        return _unknown_action(fields)
+    if tool == "write" and name not in DELETE_TOOLS and _contents_unrecorded(args, fields):
+        fields = (*fields, (Channel.PAYLOAD, Content(understood=False)))
+    return fields
+
+
+# Write tools that remove a file: they carry no contents by design.
+DELETE_TOOLS = frozenset({"deleteToolCall"})
+# Argument keys naming a file on the harness host copied into the sandbox (SLAI tb_bridge
+# `upload`): the contents are that file, not recorded text.
+HOST_PATH_KEYS = _keys("hostpath", "localpath", "hostsource", "localsource")
+# A Windows drive or UNC path: never a path inside a Linux sandbox.
+HOST_PATH_VALUE = re.compile(r"[A-Za-z]:[\\/]|\\\\[^\\\s]")
+
+
+def host_paths(tool: str, args: object) -> list[str]:
+    """Arguments naming a file on the harness host: by key on any call, by a Windows
+    shape on a write (copied into the sandbox)."""
+    return [
+        value
+        for key, value in leaves(dict(args) if isinstance(args, Mapping) else args)
+        if isinstance(value, str)
+        and (_norm(key) in HOST_PATH_KEYS or (tool == "write" and HOST_PATH_VALUE.match(value)))
+    ]
+
+
+# Edit-tool keys holding the new text but not read as payload (they stay unclassified
+# arguments): muse-code `edit_file` {find, replace}, LemonCrow `edits: [{old, new}]`,
+# dtcoder `apply_patch` {patch_text}.
+CONTENT_KEYS = _keys("replace", "replacement", "new", "patchtext")
+
+
+def _contents_unrecorded(args: object, fields: tuple[Field, ...]) -> bool:
+    """A write recording a path but neither its contents nor a host file they came from
+    (SLAI tb_bridge `write`: path and mode, the result echoing only BYTES=/SHA256=): what
+    it wrote is unknown, not empty."""
+    if any(channel == Channel.PAYLOAD for channel, _ in fields) or not is_object(args):
+        return False
+    if any(_norm(key) in CONTENT_KEYS and isinstance(v, str) for key, v in leaves(args)):
+        return False
+    return not host_paths("write", args)
+
+
+def _unknown_action(fields: tuple[Field, ...]) -> tuple[Field, ...]:
+    if any(channel == Channel.ARGUMENTS and not value.understood for channel, value in fields):
+        return fields
+    return (*fields, (Channel.ARGUMENTS, Content(understood=False)))
+
+
+def _editor_fields(tool: str, args: object) -> tuple[Field, ...]:
+    if not is_object(args):
+        return _generic_call_fields(tool, args)
+    # `command` is an operation selector, not shell code. Keep unknown selectors as
+    # unclassified evidence, but never infer a read/write from the presence of a path.
+    adapted = {k: v for k, v in args.items() if k not in {"command", "file_text"}}
+    fields = _argument_fields(tool, adapted)
+    payload = tuple(_leaf_fields("content", args.get("file_text")))
+    if tool == "other":
+        selector = tuple(_leaf_fields("action", args.get("command")))
+        return _unknown_action((*fields, *payload, *selector))
+    return (*fields, *payload)
+
+
+def _generic_call_fields(tool: str, args: object) -> tuple[Field, ...]:
+    if tool == "inert":
+        return ()
+    text = raw_input(args)
+    # Only a recognized kind says what raw text means: an unrecognized tool's raw text
+    # could be a command or a URL, so it stays unknown (string) or keyed (lone `input`).
+    if text is not None and tool in RAW_INPUT_CHANNEL:
+        return tuple(_text_fields(RAW_INPUT_CHANNEL[tool], text))
+    if not is_object(args):
+        # Unparseable arguments could hold anything: every tool-input check is unknown.
+        channel = REQUIRED.get(tool, Channel.ARGUMENTS)
+        return ((channel, Content(understood=False)),)
+    return _argument_fields(tool, args)
+
+
+def _argument_fields(tool: str, args: JsonObject) -> tuple[Field, ...]:
+    fields = [
+        found
+        for key, value in leaves(args)
+        if _norm(key) not in QUOTED_KEYS
+        for found in _leaf_fields(key, value)
+    ]
+    required = REQUIRED.get(tool)
+    if required is not None and all(channel != required for channel, _ in fields):
+        fields.append((required, Content(understood=False)))
+    if tool == "other" and not fields:
+        fields.append((Channel.ARGUMENTS, Content(understood=False)))
+    return tuple(fields)
+
+
+# Tool-program arguments that are runtime handles or limits, never a command, path, URL or
+# text: computed (`session_id: r.session_id`), they hide nothing. 4,577 of ~9,500 computed
+# arguments in TB2.1/TB4 Codex code mode were write_stdin's session_id.
+RUNTIME_HANDLE_KEYS = _keys(
+    "sessionid", "cellid", "yieldtimems", "maxoutputtokens", "timeoutms", "detail"
+)
+
+
+def _computed_field(key: str | None) -> list[Field]:
+    """A tool-program argument that isn't a literal (a variable, `${}`): unknown, unless
+    it's a runtime handle, which hides nothing."""
+    if _norm(key) in RUNTIME_HANDLE_KEYS:
+        return []
+    return [(classify(key, "")[0], Content(understood=False, computed=True))]
+
+
+def _leaf_fields(key: str | None, value: object) -> list[Field]:
+    if value is jslit.UNREAD:
+        return _computed_field(key)
+    if isinstance(value, str):
+        return _text_fields(*classify(key, value))
+    if isinstance(value, list) and _norm(key) in COMMAND_KEYS:
+        return [(Channel.COMMAND, Content(understood=False))]  # e.g. ["bash", 1]
+    return []
+
+
+def _text_fields(channel: Channel, text: str) -> list[Field]:
+    """The text's field, plus the file paths inside an apply_patch payload."""
+    fields = [(channel, content(text))]
+    if channel == Channel.PAYLOAD and PATCH_ENVELOPE.search(text):
+        fields.extend((Channel.PATH, content(m.rstrip())) for m in PATCH_PATHS.findall(text))
+    return fields

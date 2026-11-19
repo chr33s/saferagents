@@ -1,0 +1,11 @@
+.wrangler/
+__pycache__/
+node_modules/
+python_modules/
+*.egg-info/
+.venv/
+.pytest_cache/
+.venv-workers/
+pylock.toml
+.*.vars
+.env*
