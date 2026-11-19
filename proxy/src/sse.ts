@@ -51,10 +51,11 @@ export function sseData(text: string): unknown[] {
   });
 }
 
-export const anthropicEvent = (ev: { type: string }) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`;
+/** `event: <type>` framing, used by Anthropic Messages and the OpenAI Responses API. */
+export const namedEvent = (ev: { type: string }) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`;
 export const openaiData = (ev: unknown) => `data: ${JSON.stringify(ev)}\n\n`;
 export const anthropicError = (message: string) =>
-  anthropicEvent({ type: "error", error: { type: "api_error", message: `saferagents: ${message}` } } as any);
+  namedEvent({ type: "error", error: { type: "api_error", message: `saferagents: ${message}` } } as any);
 export const openaiError = (message: string) =>
   openaiData({ error: { type: "server_error", message: `saferagents: ${message}` } });
 

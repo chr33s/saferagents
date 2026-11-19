@@ -1,28 +1,54 @@
 import { anthropic } from "./anthropic.ts";
 import { audit } from "./audit.ts";
 import { loadConfig } from "./config.ts";
-import { isObject, parseConversation } from "./conversation.ts";
+import type { Upstream } from "./constants.ts";
+import { isObject } from "./conversation.ts";
+import { gemini } from "./gemini.ts";
 import { Guard } from "./guard.ts";
 import { openai } from "./openai.ts";
 import { buildRequestPolicy } from "./policy.ts";
+import { responses } from "./responses.ts";
 import type { Env, Provider } from "./types.ts";
 
 interface Route {
   method: "GET" | "POST";
-  path: string;
-  provider: Provider;
-  guarded: boolean;
+  /** Matches the proxy path; group 1 is the upstream path. */
+  match: RegExp;
+  upstream: Upstream;
+  /** Guarded routes only. */
+  provider?: Provider;
 }
 
-const ROUTES: Record<string, Route> = Object.fromEntries(
-  [
-    { method: "POST", prefix: "/anthropic", path: "/v1/messages", provider: anthropic, guarded: true },
-    { method: "POST", prefix: "/anthropic", path: "/v1/messages/count_tokens", provider: anthropic, guarded: false },
-    { method: "GET", prefix: "/anthropic", path: "/v1/models", provider: anthropic, guarded: false },
-    { method: "POST", prefix: "/openai", path: "/v1/chat/completions", provider: openai, guarded: true },
-    { method: "GET", prefix: "/openai", path: "/v1/models", provider: openai, guarded: false },
-  ].map(({ prefix, ...r }) => [`${r.method} ${prefix}${r.path}`, r as Route]),
-);
+const route = (
+  method: Route["method"],
+  prefix: string,
+  path: string | RegExp,
+  upstream: Upstream,
+  provider?: Provider,
+): Route => ({
+  method,
+  match: new RegExp(
+    `^${prefix}(${typeof path === "string" ? path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : path.source})$`,
+  ),
+  upstream,
+  provider,
+});
+
+const GEMINI_MODEL = String.raw`/v1(?:beta)?/models/[\w.-]+`;
+const ROUTES: Route[] = [
+  route("POST", "/anthropic", "/v1/messages", "anthropic", anthropic),
+  route("POST", "/anthropic", "/v1/messages/count_tokens", "anthropic"),
+  route("GET", "/anthropic", "/v1/models", "anthropic"),
+  route("POST", "/openai", "/v1/chat/completions", "openai", openai),
+  route("POST", "/openai", "/v1/responses", "openai", responses),
+  route("GET", "/openai", "/v1/models", "openai"),
+  route("POST", "/xai", "/v1/chat/completions", "xai", openai),
+  route("POST", "/xai", "/v1/responses", "xai", responses),
+  route("GET", "/xai", "/v1/models", "xai"),
+  route("POST", "/gemini", new RegExp(`${GEMINI_MODEL}:(?:generateContent|streamGenerateContent)`), "gemini", gemini),
+  route("POST", "/gemini", new RegExp(`${GEMINI_MODEL}:countTokens`), "gemini"),
+  route("GET", "/gemini", /\/v1(?:beta)?\/models(?:\/[\w.-]+)?/, "gemini"),
+];
 
 const DROP_REQUEST_HEADERS = new Set([
   "host",
@@ -92,11 +118,15 @@ export default {
     }
 
     const url = new URL(request.url);
-    const route = ROUTES[`${request.method} ${url.pathname}`];
+    let upstreamPath = "";
+    const route = ROUTES.find(
+      (r) => r.method === request.method && (upstreamPath = r.match.exec(url.pathname)?.[1] ?? ""),
+    );
     if (!route) return text(404, "saferagents: route not allowed");
-    const upstreamUrl = `${route.provider.upstreamUrl(env)}${route.path}${url.search}`;
+    const upstreamUrl = `${cfg.upstreams[route.upstream]}${upstreamPath}${url.search}`;
     const headers = upstreamHeaders(request.headers);
-    if (!route.guarded) {
+    const provider = route.provider;
+    if (!provider) {
       return fetch(upstreamUrl, {
         method: route.method,
         headers,
@@ -113,9 +143,13 @@ export default {
       return text(400, "saferagents: request body must be JSON");
     }
     if (!isObject(body) || Array.isArray(body)) return text(400, "saferagents: request body must be a JSON object");
-    const conv = parseConversation(body);
-    const rejected = route.provider.reject?.(conv, cfg);
-    if (rejected) return text(400, `saferagents: ${rejected}`);
+    const conv = provider.parse(body);
+    if (cfg.denyServerTools && conv.serverTools.length) {
+      return text(
+        400,
+        `saferagents: server-executed tools are disabled (SERVER_TOOLS=deny): ${conv.serverTools.join(", ")}`,
+      );
+    }
 
     let upstream: Response;
     try {
@@ -129,6 +163,6 @@ export default {
     const sessionId = request.headers.get("x-session-id") ?? "";
     const policy = buildRequestPolicy(conv, cfg.allowedHosts, cfg.trustToolResults);
     const guard = new Guard(conv, policy, cfg, env, (rec) => audit(ctx, env, sessionId, conv, rec));
-    return guardedResponse(upstream, route.provider, guard);
+    return guardedResponse(upstream, provider, guard);
   },
 };

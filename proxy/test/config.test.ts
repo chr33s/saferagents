@@ -53,7 +53,8 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...OFFICIAL, UPSTREAM_OPENAI_URL: "https://api.openai.com/" })).toThrow(
       /UPSTREAM_OPENAI_URL/,
     );
-    expect(() => loadConfig({})).toThrow();
+    expect(() => loadConfig({ UPSTREAM_XAI_URL: "https://x.ai.evil.dev" })).toThrow(/UPSTREAM_XAI_URL/);
+    expect(() => loadConfig({ UPSTREAM_GEMINI_URL: "https://evil.dev" })).toThrow(/UPSTREAM_GEMINI_URL/);
     expect(() =>
       loadConfig({
         UPSTREAM_ANTHROPIC_URL: "http://localhost:1",
@@ -61,6 +62,15 @@ describe("loadConfig", () => {
         ALLOW_CUSTOM_UPSTREAM: "true",
       }),
     ).not.toThrow();
+  });
+
+  it("defaults every upstream to its official API", () => {
+    expect(loadConfig({}).upstreams).toEqual({
+      anthropic: "https://api.anthropic.com",
+      openai: "https://api.openai.com",
+      xai: "https://api.x.ai",
+      gemini: "https://generativelanguage.googleapis.com",
+    });
   });
 
   it("parses EXTRA_ALLOWED_HOSTS", () => {

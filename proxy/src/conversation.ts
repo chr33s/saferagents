@@ -1,4 +1,4 @@
-// The request, parsed once into a provider-neutral shape (Anthropic Messages or OpenAI Chat Completions).
+// The request, parsed once into a provider-neutral shape.
 
 export type Block = Record<string, any>;
 
@@ -29,7 +29,8 @@ export interface Conversation {
   model: string;
   system: unknown;
   tools: unknown[];
-  mcpServers: unknown[];
+  /** Server-executed tools the request enables (§4.4); rejected under SERVER_TOOLS=deny. */
+  serverTools: string[];
   messages: Message[];
 }
 
@@ -55,12 +56,13 @@ function parseMessage(m: Block): Message {
   return { role: m.role, content: m.content, blocks, toolCalls, toolResults };
 }
 
-export function parseConversation(body: Block): Conversation {
+/** Anthropic Messages / OpenAI Chat Completions; other APIs are mapped onto this shape first. */
+export function parseConversation(body: Block, serverTools: string[] = []): Conversation {
   return {
     model: String(body.model ?? ""),
     system: body.system,
     tools: list(body.tools),
-    mcpServers: list(body.mcp_servers),
+    serverTools,
     messages: list(body.messages).filter(isObject).map(parseMessage),
   };
 }

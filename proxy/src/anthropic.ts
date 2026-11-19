@@ -1,6 +1,6 @@
-import type { Conversation } from "./conversation.ts";
+import { list, parseConversation } from "./conversation.ts";
 import { Tally, type Guard } from "./guard.ts";
-import { anthropicError, anthropicEvent, guardStream, type FrameHandler, type SseFrame } from "./sse.ts";
+import { anthropicError, namedEvent, guardStream, type FrameHandler, type SseFrame } from "./sse.ts";
 import type { Provider } from "./types.ts";
 
 interface Held {
@@ -14,9 +14,9 @@ interface Held {
 const CLIENT_TOOL_TYPE =
   /^(?:custom|bash_\d{8}|text_editor_\d{8}|memory_\d{8}|computer_\d{8}|(?:computer|browser)_toolset_\d{8})$/;
 
-export function serverTools(conv: Conversation): string[] {
-  const found = conv.mcpServers.length ? ["mcp_servers"] : [];
-  for (const t of conv.tools as any[]) {
+export function serverTools(body: Record<string, any>): string[] {
+  const found = list(body.mcp_servers).length ? ["mcp_servers"] : [];
+  for (const t of list(body.tools) as any[]) {
     if (typeof t?.type === "string" && !t.input_schema && !CLIENT_TOOL_TYPE.test(t.type)) found.push(t.type);
   }
   return found;
@@ -30,9 +30,9 @@ export function reviewName(block: any): string {
 
 /** A blocked call becomes a text block at the same index (Claude Code builds text only from deltas). */
 const noticeBlock = (index: number, notice: string) =>
-  anthropicEvent({ type: "content_block_start", index, content_block: { type: "text", text: "" } } as any) +
-  anthropicEvent({ type: "content_block_delta", index, delta: { type: "text_delta", text: notice } } as any) +
-  anthropicEvent({ type: "content_block_stop", index } as any);
+  namedEvent({ type: "content_block_start", index, content_block: { type: "text", text: "" } } as any) +
+  namedEvent({ type: "content_block_delta", index, delta: { type: "text_delta", text: notice } } as any) +
+  namedEvent({ type: "content_block_stop", index } as any);
 
 function streamHandler(guard: Guard): FrameHandler {
   const tally = new Tally();
@@ -88,7 +88,7 @@ function streamHandler(guard: Guard): FrameHandler {
         case "message_delta":
           if (tally.endTurn && ev.delta?.stop_reason === "tool_use") {
             ev.delta.stop_reason = "end_turn";
-            return anthropicEvent(ev);
+            return namedEvent(ev);
           }
           break;
         case "message_stop":
@@ -129,11 +129,7 @@ async function guardJson(res: any, guard: Guard): Promise<boolean> {
 }
 
 export const anthropic: Provider = {
-  upstreamUrl: (env) => env.UPSTREAM_ANTHROPIC_URL,
-  reject(conv, cfg) {
-    const found = cfg.denyServerTools ? serverTools(conv) : [];
-    return found.length ? `server-executed tools are disabled (SERVER_TOOLS=deny): ${found.join(", ")}` : null;
-  },
+  parse: (body) => parseConversation(body, serverTools(body)),
   stream: (guard) => guardStream(streamHandler(guard)),
   guardJson,
 };

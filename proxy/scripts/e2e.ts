@@ -14,40 +14,68 @@ const ITER = Number(process.argv[3] ?? 20);
 const UPSTREAM = process.env.MOCK_UPSTREAM ?? "http://localhost:8790";
 const TOKEN = process.env.PROXY_AUTH_TOKEN ?? "dev-token";
 
-const TOOLS = ["Bash", "Read", "Write", "Edit"].map((name) => ({ name, input_schema: { type: "object" } }));
-const OPENAI_TOOLS = ["Bash", "Read", "Write"].map((name) => ({
-  type: "function",
-  function: { name, parameters: { type: "object" } },
-}));
+const task = (scenario: string) => `Fix the failing test. SCENARIO:${scenario}`;
+const NAMES = ["Bash", "Read", "Write", "Edit"];
+
+/** Per API: proxy path, request body, and how a kept (released) call appears in the output. */
+const APIS = {
+  anthropic: {
+    path: "/anthropic/v1/messages",
+    body: (s: string) => ({
+      model: "mock",
+      max_tokens: 100,
+      stream: true,
+      tools: NAMES.map((name) => ({ name, input_schema: { type: "object" } })),
+      messages: [{ role: "user", content: task(s) }],
+    }),
+    kept: /"type":"tool_use"/g,
+  },
+  openai: {
+    path: "/openai/v1/chat/completions",
+    body: (s: string) => ({
+      model: "mock",
+      stream: true,
+      tools: NAMES.map((name) => ({ type: "function", function: { name, parameters: { type: "object" } } })),
+      messages: [{ role: "user", content: task(s) }],
+    }),
+    kept: /"id":"call_\d+"/g,
+  },
+  "xai-responses": {
+    path: "/xai/v1/responses",
+    body: (s: string) => ({
+      model: "mock",
+      stream: true,
+      tools: NAMES.map((name) => ({ type: "function", name, parameters: { type: "object" } })),
+      input: [{ role: "user", content: task(s) }],
+    }),
+    kept: /"type":"response\.output_item\.done"[^\n]*"type":"function_call"/g,
+  },
+  gemini: {
+    path: "/gemini/v1beta/models/mock:streamGenerateContent?alt=sse",
+    body: (s: string) => ({
+      tools: [{ functionDeclarations: NAMES.map((name) => ({ name, parameters: { type: "object" } })) }],
+      contents: [{ role: "user", parts: [{ text: task(s) }] }],
+    }),
+    kept: /"functionCall"/g,
+  },
+} as const;
+type Api = keyof typeof APIS;
 
 type Expect = { blocked: string[]; kept: number };
-const CASES: Array<{ scenario: string; provider: "anthropic" | "openai"; expect: Expect }> = [
-  { scenario: "text", provider: "anthropic", expect: { blocked: [], kept: 0 } },
-  { scenario: "allowed", provider: "anthropic", expect: { blocked: [], kept: 1 } },
-  { scenario: "untrusted-host", provider: "anthropic", expect: { blocked: ["STAGE1-UNTRUSTED-HOST"], kept: 0 } },
-  { scenario: "env-exfil", provider: "anthropic", expect: { blocked: ["saferagents.env_exfil"], kept: 0 } },
-  {
-    scenario: "credential-read",
-    provider: "anthropic",
-    expect: { blocked: ["saferagents.credential_store"], kept: 0 },
-  },
-  { scenario: "reverse-shell", provider: "anthropic", expect: { blocked: ["STAGE1-UNTRUSTED-HOST"], kept: 0 } },
-  { scenario: "conftest", provider: "anthropic", expect: { blocked: ["tamper.harness_hooks"], kept: 0 } },
-  { scenario: "parallel", provider: "anthropic", expect: { blocked: ["saferagents.credential_store"], kept: 2 } },
-  { scenario: "allowed", provider: "openai", expect: { blocked: [], kept: 1 } },
-  { scenario: "env-exfil", provider: "openai", expect: { blocked: ["saferagents.env_exfil"], kept: 0 } },
+const SCENARIOS: Array<{ scenario: string; expect: Expect }> = [
+  { scenario: "text", expect: { blocked: [], kept: 0 } },
+  { scenario: "allowed", expect: { blocked: [], kept: 1 } },
+  { scenario: "untrusted-host", expect: { blocked: ["STAGE1-UNTRUSTED-HOST"], kept: 0 } },
+  { scenario: "env-exfil", expect: { blocked: ["saferagents.env_exfil"], kept: 0 } },
+  { scenario: "credential-read", expect: { blocked: ["saferagents.credential_store"], kept: 0 } },
+  { scenario: "reverse-shell", expect: { blocked: ["STAGE1-UNTRUSTED-HOST"], kept: 0 } },
+  { scenario: "conftest", expect: { blocked: ["tamper.harness_hooks"], kept: 0 } },
+  { scenario: "parallel", expect: { blocked: ["saferagents.credential_store"], kept: 2 } },
 ];
 
-function body(provider: "anthropic" | "openai", scenario: string) {
-  const messages = [{ role: "user", content: `Fix the failing test. SCENARIO:${scenario}` }];
-  return provider === "anthropic"
-    ? { model: "mock", max_tokens: 100, stream: true, tools: TOOLS, messages }
-    : { model: "mock", stream: true, tools: OPENAI_TOOLS, messages };
-}
-
-async function run(base: string, provider: "anthropic" | "openai", scenario: string, id: string, viaProxy: boolean) {
-  const path = provider === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
-  const url = viaProxy ? `${base}/${provider}${path}` : `${base}${path}`;
+async function run(base: string, api: Api, scenario: string, id: string, viaProxy: boolean) {
+  const path = APIS[api].path;
+  const url = viaProxy ? `${base}${path}` : `${base}${path.replace(/^\/[a-z]+/, "")}`;
   const t0 = performance.timeOrigin + performance.now();
   const res = await fetch(url, {
     method: "POST",
@@ -57,7 +85,7 @@ async function run(base: string, provider: "anthropic" | "openai", scenario: str
       "x-mock-request-id": id,
       "x-session-id": "e2e",
     },
-    body: JSON.stringify(body(provider, scenario)),
+    body: JSON.stringify(APIS[api].body(scenario)),
   });
   if (!res.ok || !res.body) throw new Error(`${url}: ${res.status} ${await res.text()}`);
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -75,7 +103,7 @@ async function run(base: string, provider: "anthropic" | "openai", scenario: str
     // Release = Anthropic content_block_stop / OpenAI tool_calls chunk, or a [saferagents] notice.
     const fresh = text.slice(before.length);
     const releases =
-      provider === "anthropic"
+      api === "anthropic"
         ? (fresh.match(/"type":"tool_use"|\[saferagents\]/g) ?? []).length
         : (fresh.match(/"tool_calls":\[\{|\[saferagents\]/g) ?? []).length;
     for (let i = 0; i < releases; i++) toolSeen.push(now);
@@ -87,19 +115,18 @@ async function run(base: string, provider: "anthropic" | "openai", scenario: str
 async function main() {
   let failures = 0;
   console.log(`verdicts via ${PROXY}`);
-  for (const c of CASES) {
-    const { text } = await run(PROXY, c.provider, c.scenario, `v-${c.provider}-${c.scenario}`, true);
-    const notices = text.match(/\[saferagents\] blocked call to `[^`]+`: [^"\\]*/g) ?? [];
-    const kept =
-      c.provider === "anthropic"
-        ? (text.match(/"type":"tool_use"/g) ?? []).length
-        : (text.match(/"id":"call_\d+"/g) ?? []).length;
-    const ok =
-      kept === c.expect.kept &&
-      c.expect.blocked.every((rule) => notices.some((n) => n.includes(rule))) &&
-      notices.length === c.expect.blocked.length;
-    if (!ok) failures++;
-    console.log(`${ok ? "PASS" : "FAIL"} ${c.provider}/${c.scenario}: kept=${kept} notices=${JSON.stringify(notices)}`);
+  for (const api of Object.keys(APIS) as Api[]) {
+    for (const c of SCENARIOS) {
+      const { text } = await run(PROXY, api, c.scenario, `v-${api}-${c.scenario}`, true);
+      const notices = [...new Set(text.match(/\[saferagents\] blocked call to `[^`]+`: [^"\\]*/g) ?? [])];
+      const kept = (text.match(APIS[api].kept) ?? []).length;
+      const ok =
+        kept === c.expect.kept &&
+        c.expect.blocked.every((rule) => notices.some((n) => n.includes(rule))) &&
+        notices.length === c.expect.blocked.length;
+      if (!ok) failures++;
+      console.log(`${ok ? "PASS" : "FAIL"} ${api}/${c.scenario}: kept=${kept} notices=${JSON.stringify(notices)}`);
+    }
   }
 
   const added: number[] = [];

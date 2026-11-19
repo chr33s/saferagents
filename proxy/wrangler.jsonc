@@ -12,6 +12,8 @@
   "vars": {
     "UPSTREAM_ANTHROPIC_URL": "https://api.anthropic.com",
     "UPSTREAM_OPENAI_URL": "https://api.openai.com",
+    "UPSTREAM_XAI_URL": "https://api.x.ai",
+    "UPSTREAM_GEMINI_URL": "https://generativelanguage.googleapis.com",
     "BLOCK_SEVERITY": "high", // low | medium | high | critical
     "SUSPICIOUS_ACTION": "block", // block | allow
     "SCANNER_FAIL_MODE": "block", // block | allow

@@ -1,4 +1,3 @@
-import type { Config } from "./config.ts";
 import type { FindingSeverity } from "./constants.ts";
 import type { Conversation } from "./conversation.ts";
 import type { Guard } from "./guard.ts";
@@ -16,11 +15,10 @@ export interface AtifStep {
   observation?: { results: Array<{ source_call_id: string; content: string }> };
 }
 
-/** Everything that differs between the Anthropic and OpenAI APIs. */
+/** Everything that differs between model APIs. */
 export interface Provider {
-  upstreamUrl(env: Env): string;
-  /** Request-level rejection (400), e.g. server tools under `SERVER_TOOLS=deny`. */
-  reject?(conv: Conversation, cfg: Config): string | null;
+  /** The request in the shared conversation shape, including the server-executed tools it enables. */
+  parse(body: Record<string, any>): Conversation;
   stream(guard: Guard): TransformStream<Uint8Array, Uint8Array>;
   /** Guards a non-streaming body in place; true if anything changed. */
   guardJson(body: any, guard: Guard): Promise<boolean>;
@@ -31,7 +29,5 @@ export interface Env {
   AI?: any;
   TRACE_BUCKET?: R2Bucket;
   PROXY_AUTH_TOKEN?: string;
-  UPSTREAM_ANTHROPIC_URL: string;
-  UPSTREAM_OPENAI_URL: string;
   [key: string]: unknown;
 }

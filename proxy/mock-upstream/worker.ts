@@ -2,7 +2,7 @@
  * Mock upstream Worker for staging runs (§8 smoke, §9.4 budgets); point a staging proxy at it with
  * ALLOW_CUSTOM_UPSTREAM=true. Never use in production.
  */
-import { anthropicFrames, openaiFrames, scenarioOf } from "../scripts/sse-fixtures.ts";
+import { framesFor, scenarioOf } from "../scripts/sse-fixtures.ts";
 
 const DEFAULT_FRAME_DELAY_MS = 15;
 
@@ -18,7 +18,7 @@ export default {
     } catch {}
     const scenario = scenarioOf(body);
     const delay = Number(request.headers.get("x-mock-frame-delay") ?? DEFAULT_FRAME_DELAY_MS);
-    const frames = url.pathname.endsWith("/chat/completions") ? openaiFrames(scenario) : anthropicFrames(scenario);
+    const frames = framesFor(url.pathname, scenario);
     if (body?.stream === false) return Response.json({ mock: "non-streaming not modelled" }, { status: 400 });
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();

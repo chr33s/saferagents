@@ -1,6 +1,12 @@
-import { anthropicFrames, openaiFrames, type FixtureCall } from "../scripts/sse-fixtures.ts";
+import {
+  anthropicFrames,
+  geminiFrames,
+  openaiFrames,
+  responsesFrames,
+  type FixtureCall,
+} from "../scripts/sse-fixtures.ts";
 import { loadConfig, type Config } from "../src/config.ts";
-import { parseConversation } from "../src/conversation.ts";
+import { parseConversation, type Conversation } from "../src/conversation.ts";
 import { Guard, type AuditRecord } from "../src/guard.ts";
 import { buildRequestPolicy } from "../src/policy.ts";
 import { sseData } from "../src/sse.ts";
@@ -101,13 +107,33 @@ export function openaiBody(userText = "help me", extra: Record<string, unknown> 
   };
 }
 
+export function responsesBody(userText = "help me", extra: Record<string, unknown> = {}) {
+  return {
+    model: "grok-test",
+    instructions: "You are a coding agent.",
+    tools: [{ type: "function", name: "Bash", parameters: { type: "object" } }, { type: "local_shell" }],
+    input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+    stream: true,
+    ...extra,
+  };
+}
+
+export function geminiBody(userText = "help me", extra: Record<string, unknown> = {}) {
+  return {
+    systemInstruction: { parts: [{ text: "You are a coding agent." }] },
+    tools: [{ functionDeclarations: [{ name: "run_shell_command", parameters: { type: "object" } }] }],
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+    ...extra,
+  };
+}
+
 export function makeGuard(
   body: any,
-  opts: { env?: Record<string, unknown>; scanner?: ScanFn; ai?: any } = {},
+  opts: { env?: Record<string, unknown>; scanner?: ScanFn; ai?: any; parse?: (body: any) => Conversation } = {},
 ): { guard: Guard; cfg: Config; audits: AuditRecord[] } {
   const envVars = { ...OFFICIAL, ENABLE_JUDGE: "false", ...opts.env, AI: opts.ai };
   const cfg = loadConfig(envVars);
-  const conv = parseConversation(body);
+  const conv = (opts.parse ?? parseConversation)(body);
   const policy = buildRequestPolicy(conv, cfg.allowedHosts, cfg.trustToolResults);
   const audits: AuditRecord[] = [];
   const env = { ...envVars, ATIF_SCANNER: { scan: opts.scanner ?? fakeScanner().scan } } as unknown as Env;
@@ -126,6 +152,12 @@ export const openaiToolStream = (
   calls: FixtureCall[],
   opts: { text?: string; finish?: boolean; done?: boolean } = {},
 ) => openaiFrames({ calls, text: opts.text }, opts).map((f) => f.frame);
+
+export const responsesToolStream = (calls: FixtureCall[], opts: { text?: string; complete?: boolean } = {}) =>
+  responsesFrames({ calls, text: opts.text }, opts).map((f) => f.frame);
+
+export const geminiToolStream = (calls: FixtureCall[], opts: { text?: string } = {}) =>
+  geminiFrames({ calls, text: opts.text }).map((f) => f.frame);
 
 /** Runs `chunks` through a byte stream transform and returns the decoded output. */
 export async function runStream(t: TransformStream<Uint8Array, Uint8Array>, chunks: string[]): Promise<string> {

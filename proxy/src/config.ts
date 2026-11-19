@@ -1,6 +1,14 @@
-import { DEFAULT_ALLOWED_HOSTS, FINDING_SEVERITIES, RESERVED_HOSTS, type FindingSeverity } from "./constants.ts";
+import {
+  DEFAULT_ALLOWED_HOSTS,
+  FINDING_SEVERITIES,
+  RESERVED_HOSTS,
+  UPSTREAMS,
+  type FindingSeverity,
+  type Upstream,
+} from "./constants.ts";
 
 export interface Config {
+  upstreams: Record<Upstream, string>;
   blockSeverity: FindingSeverity;
   suspiciousAction: "block" | "allow";
   scannerFailMode: "block" | "allow";
@@ -37,18 +45,20 @@ function probability(name: string, value: string | undefined, dflt: number): num
 
 export function loadConfig(env: Record<string, unknown>): Config {
   const s = (k: string) => (typeof env[k] === "string" ? (env[k] as string) : undefined);
-  // Credentials are forwarded only to the official APIs unless the operator opts out explicitly (§8.1).
-  if (s("ALLOW_CUSTOM_UPSTREAM") !== "true") {
-    if (s("UPSTREAM_ANTHROPIC_URL") !== "https://api.anthropic.com")
-      throw new Error("UPSTREAM_ANTHROPIC_URL must be https://api.anthropic.com");
-    if (s("UPSTREAM_OPENAI_URL") !== "https://api.openai.com")
-      throw new Error("UPSTREAM_OPENAI_URL must be https://api.openai.com");
+  const allowCustom = s("ALLOW_CUSTOM_UPSTREAM") === "true";
+  const upstreams = {} as Record<Upstream, string>;
+  for (const [name, { env: key, url }] of Object.entries(UPSTREAMS) as Array<
+    [Upstream, { env: string; url: string }]
+  >) {
+    upstreams[name] = s(key) ?? url;
+    if (!allowCustom && upstreams[name] !== url) throw new Error(`${key} must be ${url}`);
   }
   const extra = (s("EXTRA_ALLOWED_HOSTS") ?? "")
     .split(",")
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean);
   return {
+    upstreams,
     blockSeverity: oneOf("BLOCK_SEVERITY", s("BLOCK_SEVERITY"), FINDING_SEVERITIES, "high"),
     suspiciousAction: oneOf("SUSPICIOUS_ACTION", s("SUSPICIOUS_ACTION"), ["block", "allow"] as const, "block"),
     scannerFailMode: oneOf("SCANNER_FAIL_MODE", s("SCANNER_FAIL_MODE"), ["block", "allow"] as const, "block"),

@@ -6,7 +6,7 @@
  *   GET /__timings  → { [requestId]: { toolStopAt: number[] } }
  */
 import { createServer } from "node:http";
-import { anthropicFrames, openaiFrames, scenarioOf } from "./sse-fixtures.ts";
+import { framesFor, scenarioOf } from "./sse-fixtures.ts";
 
 const PORT = Number(process.argv[2] ?? 8790);
 const FRAME_DELAY_MS = Number(process.env.FRAME_DELAY_MS ?? 15);
@@ -34,8 +34,7 @@ createServer(async (req, res) => {
   const scenario = scenarioOf(body);
   const requestId = String(req.headers["x-mock-request-id"] ?? Date.now());
   timings[requestId] = { toolStopAt: [] };
-  const openai = req.url?.endsWith("/chat/completions") ?? false;
-  const frames = openai ? openaiFrames(scenario) : anthropicFrames(scenario);
+  const frames = framesFor(new URL(req.url ?? "/", "http://mock").pathname, scenario);
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
   for (const f of frames) {
     res.write(f.frame);

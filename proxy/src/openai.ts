@@ -1,3 +1,4 @@
+import { parseConversation } from "./conversation.ts";
 import { Tally, type Guard } from "./guard.ts";
 import { guardStream, openaiData, openaiError, type FrameHandler, type SseFrame } from "./sse.ts";
 import type { Provider } from "./types.ts";
@@ -131,8 +132,9 @@ async function guardJson(res: any, guard: Guard): Promise<boolean> {
   return changed;
 }
 
+/** Chat Completions (OpenAI, xAI). */
 export const openai: Provider = {
-  upstreamUrl: (env) => env.UPSTREAM_OPENAI_URL,
+  parse: (body) => parseConversation(body),
   stream: (guard) => guardStream(streamHandler(guard)),
   guardJson,
 };

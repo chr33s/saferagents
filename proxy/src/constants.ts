@@ -22,8 +22,18 @@ export const DEFAULT_ALLOWED_HOSTS = [
 // RFC 2606: unregistrable, so a call reaches no one through them.
 export const RESERVED_HOSTS = ["example.com", "example.net", "example.org"];
 
+// Credentials are forwarded only to these, unless ALLOW_CUSTOM_UPSTREAM=true (§8.1).
+export const UPSTREAMS = {
+  anthropic: { env: "UPSTREAM_ANTHROPIC_URL", url: "https://api.anthropic.com" },
+  openai: { env: "UPSTREAM_OPENAI_URL", url: "https://api.openai.com" },
+  xai: { env: "UPSTREAM_XAI_URL", url: "https://api.x.ai" },
+  gemini: { env: "UPSTREAM_GEMINI_URL", url: "https://generativelanguage.googleapis.com" },
+} as const;
+export type Upstream = keyof typeof UPSTREAMS;
+
+// Harness settings that route traffic through this proxy, and its auth header.
 export const SELF_PROTECT_PATTERN =
-  /\b(?:ANTHROPIC_BASE_URL|OPENAI_BASE_URL|ANTHROPIC_CUSTOM_HEADERS|x-saferagents-key)\b/i;
+  /\b(?:ANTHROPIC_BASE_URL|ANTHROPIC_CUSTOM_HEADERS|OPENAI_BASE_URL|GOOGLE_GEMINI_BASE_URL|GEMINI_CLI_CUSTOM_HEADERS|GROK_BASE_URL|XAI_BASE_URL|x-saferagents-key)\b/i;
 
 // Commands and APIs that reach a host (superset of upstream NETWORK_PATTERN).
 export const NETWORK_PATTERN = new RegExp(

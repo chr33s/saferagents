@@ -38,12 +38,18 @@ export const SCENARIOS: Record<string, Fixture> = {
   },
 };
 
-/** The scenario named by `SCENARIO:<name>` in the last user message; "text" by default. */
-export function scenarioOf(body: any): Fixture {
-  const msgs = Array.isArray(body?.messages) ? body.messages : [];
-  const last = msgs.findLast((m: any) => m?.role === "user");
-  const text = typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
-  return SCENARIOS[/SCENARIO:([a-z-]+)/.exec(text)?.[1] ?? "text"] ?? SCENARIOS.text;
+/** The scenario named by the last `SCENARIO:<name>` in the request (any API shape); "text" by default. */
+export function scenarioOf(body: unknown): Fixture {
+  const name = [...JSON.stringify(body ?? "").matchAll(/SCENARIO:([a-z-]+)/g)].at(-1)?.[1];
+  return SCENARIOS[name ?? "text"] ?? SCENARIOS.text;
+}
+
+/** The fixture stream for an upstream path. */
+export function framesFor(path: string, fixture: Fixture): Frame[] {
+  if (path.endsWith("/responses")) return responsesFrames(fixture);
+  if (path.endsWith("/chat/completions")) return openaiFrames(fixture);
+  if (path.includes(":streamGenerateContent")) return geminiFrames(fixture);
+  return anthropicFrames(fixture);
 }
 
 export const aEvent = (ev: any) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`;
@@ -104,5 +110,74 @@ export function openaiFrames({ text, calls }: Fixture, { finish = true, done = t
   });
   if (finish) push({}, calls.length ? "tool_calls" : "stop", calls.length > 0);
   if (done) out.push({ frame: "data: [DONE]\n\n" });
+  return out;
+}
+
+export function responsesFrames({ text, calls }: Fixture, { complete = true } = {}): Frame[] {
+  const out: Frame[] = [];
+  let seq = 0;
+  const push = (ev: any, toolStop?: boolean) =>
+    out.push({ frame: aEvent({ ...ev, sequence_number: seq++ }), toolStop });
+  const response = { id: "resp_mock", object: "response", model: "mock", status: "in_progress", output: [] as any[] };
+  push({ type: "response.created", response });
+  const output: any[] = [];
+  if (text) {
+    const at = { output_index: 0, item_id: "msg_0", content_index: 0 };
+    const item = {
+      type: "message",
+      id: "msg_0",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }],
+    };
+    push({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...item, status: "in_progress", content: [] },
+    });
+    push({ type: "response.content_part.added", ...at, part: { type: "output_text", text: "", annotations: [] } });
+    for (const w of words(text)) push({ type: "response.output_text.delta", ...at, delta: w });
+    push({ type: "response.output_text.done", ...at, text });
+    push({ type: "response.content_part.done", ...at, part: item.content[0] });
+    push({ type: "response.output_item.done", output_index: 0, item });
+    output.push(item);
+  }
+  for (const c of calls) {
+    const i = output.length;
+    const args = JSON.stringify(c.input);
+    const item = {
+      type: "function_call",
+      id: `fc_${i}`,
+      call_id: `call_${i}`,
+      name: c.name,
+      arguments: args,
+      status: "completed",
+    };
+    push({
+      type: "response.output_item.added",
+      output_index: i,
+      item: { ...item, arguments: "", status: "in_progress" },
+    });
+    for (const part of slices(args))
+      push({ type: "response.function_call_arguments.delta", output_index: i, item_id: item.id, delta: part });
+    push({ type: "response.function_call_arguments.done", output_index: i, item_id: item.id, arguments: args });
+    push({ type: "response.output_item.done", output_index: i, item }, true);
+    output.push(item);
+  }
+  if (complete) push({ type: "response.completed", response: { ...response, status: "completed", output } });
+  return out;
+}
+
+export function geminiFrames({ text, calls }: Fixture): Frame[] {
+  const chunk = (parts: any[], extra: any = {}) =>
+    `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts }, index: 0, ...extra }], modelVersion: "mock" })}\r\n\r\n`;
+  const out: Frame[] = words(text).map((w) => ({ frame: chunk([{ text: w }]) }));
+  for (const c of calls) {
+    out.push({
+      frame: chunk([{ functionCall: { name: c.name, args: c.input }, thoughtSignature: "sig" }]),
+      toolStop: true,
+    });
+  }
+  out.push({ frame: chunk([{ text: "" }], { finishReason: "STOP" }) });
   return out;
 }

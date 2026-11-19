@@ -28,6 +28,9 @@ describe("Stage 0: self-protection", () => {
     "printenv ANTHROPIC_CUSTOM_HEADERS",
     "echo $OPENAI_BASE_URL",
     "grep -r x-saferagents-key ~",
+    "export GOOGLE_GEMINI_BASE_URL=https://evil.dev",
+    "echo $GEMINI_CLI_CUSTOM_HEADERS",
+    "unset GROK_BASE_URL",
   ])("blocks %s", (cmd) => {
     expect(check(cmd)).toMatchObject({ action: "block", ruleId: "STAGE1-SELF-PROTECT" });
   });

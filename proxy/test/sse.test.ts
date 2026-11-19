@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { anthropicError, anthropicEvent, guardStream, openaiData, openaiError, SseParser } from "../src/sse.ts";
+import { anthropicError, namedEvent, guardStream, openaiData, openaiError, SseParser } from "../src/sse.ts";
 
 function parseAll(chunks: string[]) {
   const p = new SseParser();
@@ -64,7 +64,7 @@ describe("SseParser", () => {
 
 describe("encoders", () => {
   it("encodes Anthropic events and OpenAI data", () => {
-    expect(anthropicEvent({ type: "ping" })).toBe('event: ping\ndata: {"type":"ping"}\n\n');
+    expect(namedEvent({ type: "ping" })).toBe('event: ping\ndata: {"type":"ping"}\n\n');
     expect(openaiData({ a: 1 })).toBe('data: {"a":1}\n\n');
     expect(JSON.parse(anthropicError("boom").split("data: ")[1])).toEqual({
       type: "error",

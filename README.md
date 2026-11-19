@@ -1,6 +1,6 @@
 # saferagents
 
-Hugging Face's [`safeagents`](https://github.com/huggingface/safeagents) tool-call guard, run on Cloudflare's edge. It proxies a coding-agent harness (Claude Code, OpenCode, Pi, Codex) to the Anthropic Messages or OpenAI Chat Completions API, holds each tool call until its arguments are complete, then releases it byte for byte or replaces it with a text notice. Design and validation: [`spec.md`](spec.md).
+Hugging Face's [`safeagents`](https://github.com/huggingface/safeagents) tool-call guard, run on Cloudflare's edge. It proxies a coding-agent harness (Claude Code, Codex, OpenCode, Pi, Gemini CLI, Grok clients) to Anthropic Messages, OpenAI Chat Completions / Responses (OpenAI and xAI) or the Gemini API, holds each tool call until its arguments are complete, then releases it byte for byte or replaces it with a text notice. Design and validation: [`spec.md`](spec.md).
 
 | Worker | Path | Role |
 |---|---|---|
@@ -44,11 +44,15 @@ openssl rand -base64 32 | npx wrangler secret put PROXY_AUTH_TOKEN
 npx wrangler deploy
 ```
 
-Point the harness at the proxy:
+Point the harness at the proxy (`<proxy>` = `https://saferagents-proxy.<subdomain>.workers.dev`):
 
-```bash
-export ANTHROPIC_BASE_URL="https://saferagents-proxy.<subdomain>.workers.dev/anthropic"
-export ANTHROPIC_CUSTOM_HEADERS="x-saferagents-key: <token>"
-```
+| Harness | Base URL | Proxy key |
+|---|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL=<proxy>/anthropic` | `ANTHROPIC_CUSTOM_HEADERS="x-saferagents-key: <token>"` |
+| Codex, OpenCode, Pi (OpenAI) | `<proxy>/openai/v1` | `x-saferagents-key` header |
+| Grok (xAI) clients | `<proxy>/xai/v1` (Chat Completions or Responses) | `x-saferagents-key` header |
+| Gemini CLI (API key auth) | `GOOGLE_GEMINI_BASE_URL=<proxy>/gemini` | `GEMINI_CLI_CUSTOM_HEADERS="x-saferagents-key: <token>"`* |
 
-OpenAI-compatible harnesses use `https://saferagents-proxy.<subdomain>.workers.dev/openai/v1` with the same header. Configuration lives in `proxy/wrangler.jsonc` (`vars`); every default fails closed (spec §3.4). Workers Paid is required. Credential policy: spec §8.1.
+\*Documented only by third-party gateways; confirm your Gemini CLI version sends it. Google OAuth login bypasses the base URL. The Antigravity IDE and Cursor can't be pointed at a custom endpoint with a custom header, so they aren't supported.
+
+Configuration lives in `proxy/wrangler.jsonc` (`vars`); every default fails closed (spec §3.4). Workers Paid is required. Credential policy: spec §8.1.
