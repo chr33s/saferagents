@@ -29,5 +29,6 @@
     "JUDGE_TIMEOUT_MS": "15000",
     "TRACE_AGENT_STEPS": "20",
     "TRACE_MAX_RESULT_CHARS": "2000",
+    "AUDIT_MODE": "all", // all (write audit records to TRACE_BUCKET when bound) | off
   },
 }

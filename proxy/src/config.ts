@@ -23,6 +23,7 @@ export interface Config {
   judgeTimeoutMs: number;
   traceAgentSteps: number;
   traceMaxResultChars: number;
+  auditMode: "off" | "all";
 }
 
 function oneOf<T extends string>(name: string, value: string | undefined, allowed: readonly T[], dflt: T): T {
@@ -74,5 +75,6 @@ export function loadConfig(env: Record<string, unknown>): Config {
     judgeTimeoutMs: positiveInt("JUDGE_TIMEOUT_MS", s("JUDGE_TIMEOUT_MS"), 15000),
     traceAgentSteps: positiveInt("TRACE_AGENT_STEPS", s("TRACE_AGENT_STEPS"), 20),
     traceMaxResultChars: positiveInt("TRACE_MAX_RESULT_CHARS", s("TRACE_MAX_RESULT_CHARS"), 2000),
+    auditMode: oneOf("AUDIT_MODE", s("AUDIT_MODE"), ["off", "all"] as const, "all"),
   };
 }

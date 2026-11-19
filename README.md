@@ -56,3 +56,5 @@ Point the harness at the proxy (`<proxy>` = `https://saferagents-proxy.<subdomai
 \*Documented only by third-party gateways; confirm your Gemini CLI version sends it. Google OAuth login bypasses the base URL. The Antigravity IDE and Cursor can't be pointed at a custom endpoint with a custom header, so they aren't supported.
 
 Configuration lives in `proxy/wrangler.jsonc` (`vars`); every default fails closed (spec §3.4). Workers Paid is required. Credential policy: spec §8.1.
+
+Audit records (scrubbed JSON for each blocked, suspicious, or noted call, such as a scanner error) are written to R2 when `TRACE_BUCKET` is bound and `AUDIT_MODE` is `all` (the default). Set `AUDIT_MODE=off` to keep the bucket bound but stop writing. Every audited call also emits one `console.warn` line: verdict, tool, and the reason or rule IDs, judge outcome and note, scrubbed and truncated to 300 characters.

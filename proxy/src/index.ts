@@ -161,8 +161,9 @@ export default {
 
     // Only the session id is read from headers: credentials never reach the guard (§8.1).
     const sessionId = request.headers.get("x-session-id") ?? "";
+    const bucket = cfg.auditMode === "all" ? env.TRACE_BUCKET : undefined;
     const policy = buildRequestPolicy(conv, cfg.allowedHosts, cfg.trustToolResults);
-    const guard = new Guard(conv, policy, cfg, env, (rec) => audit(ctx, env, sessionId, conv, rec));
+    const guard = new Guard(conv, policy, cfg, env, (rec) => audit(ctx, bucket, sessionId, conv, rec));
     return guardedResponse(upstream, provider, guard);
   },
 };

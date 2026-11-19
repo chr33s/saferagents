@@ -344,6 +344,7 @@ Toolchain: Node 26, Python 3.14 and uv 0.13 pinned in `mise.toml`. `mise run lin
     "JUDGE_TIMEOUT_MS": "15000",
     "TRACE_AGENT_STEPS": "20",
     "TRACE_MAX_RESULT_CHARS": "2000",
+    "AUDIT_MODE": "all", // all (write audit records to TRACE_BUCKET when bound) | off
   },
 }
 ```
@@ -376,6 +377,7 @@ export interface Config {
   judgeTimeoutMs: number;
   traceAgentSteps: number;
   traceMaxResultChars: number;
+  auditMode: "off" | "all";
 }
 
 function oneOf<T extends string>(name: string, value: string | undefined, allowed: readonly T[], dflt: T): T {
@@ -427,6 +429,7 @@ export function loadConfig(env: Record<string, unknown>): Config {
     judgeTimeoutMs: positiveInt("JUDGE_TIMEOUT_MS", s("JUDGE_TIMEOUT_MS"), 15000),
     traceAgentSteps: positiveInt("TRACE_AGENT_STEPS", s("TRACE_AGENT_STEPS"), 20),
     traceMaxResultChars: positiveInt("TRACE_MAX_RESULT_CHARS", s("TRACE_MAX_RESULT_CHARS"), 2000),
+    auditMode: oneOf("AUDIT_MODE", s("AUDIT_MODE"), ["off", "all"] as const, "all"),
   };
 }
 ```
@@ -1437,8 +1440,9 @@ export default {
 
     // Only the session id is read from headers: credentials never reach the guard (§8.1).
     const sessionId = request.headers.get("x-session-id") ?? "";
+    const bucket = cfg.auditMode === "all" ? env.TRACE_BUCKET : undefined;
     const policy = buildRequestPolicy(conv, cfg.allowedHosts, cfg.trustToolResults);
-    const guard = new Guard(conv, policy, cfg, env, (rec) => audit(ctx, env, sessionId, conv, rec));
+    const guard = new Guard(conv, policy, cfg, env, (rec) => audit(ctx, bucket, sessionId, conv, rec));
     return guardedResponse(upstream, provider, guard);
   },
 };
@@ -2198,18 +2202,29 @@ export function guardStream(h: FrameHandler): TransformStream<Uint8Array, Uint8A
 #### `src/audit.ts`
 <!-- source: proxy/src/audit.ts -->
 ```typescript
-// One R2 object per non-passed call. Never headers; arguments and task are scrubbed and truncated.
+// Every audited call (non-passed, or passed with a note) gets one scrubbed console line, and one R2 object when a
+// bucket is given (AUDIT_MODE, §8.1). Never headers; arguments, task and log text are scrubbed and truncated.
 import type { Conversation } from "./conversation.ts";
 import type { AuditRecord } from "./guard.ts";
 import { taskText } from "./judge.ts";
 import { scrub } from "./scrub.ts";
-import type { Env } from "./types.ts";
 
-export function audit(ctx: ExecutionContext, env: Env, sessionId: string, conv: Conversation, rec: AuditRecord): void {
-  console.warn(
-    `[saferagents] ${rec.verdict} call to ${rec.tool}: ${rec.reason ?? rec.findings.map((f) => f.ruleId).join(", ")}`,
-  );
-  if (!env.TRACE_BUCKET) return;
+export function audit(
+  ctx: ExecutionContext,
+  bucket: R2Bucket | undefined,
+  sessionId: string,
+  conv: Conversation,
+  rec: AuditRecord,
+): void {
+  const detail = [
+    rec.reason ?? rec.findings.map((f) => f.ruleId).join(", "),
+    rec.judge && `judge: ${rec.judge}`,
+    rec.note,
+  ]
+    .filter(Boolean)
+    .join("; ");
+  console.warn(`[saferagents] ${rec.verdict} call to ${rec.tool}: ${scrub(detail).slice(0, 300)}`);
+  if (!bucket) return;
   const session = sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || "anon";
   const now = new Date();
   const key = `traces/${now.toISOString().slice(0, 10)}/${session}/${now.getTime()}-${crypto.randomUUID()}.json`;
@@ -2226,7 +2241,8 @@ export function audit(ctx: ExecutionContext, env: Env, sessionId: string, conv: 
     task: scrub(taskText(conv)).slice(-2048),
   };
   ctx.waitUntil(
-    env.TRACE_BUCKET.put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } })
+    bucket
+      .put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } })
       .then(() => undefined)
       .catch((e) => console.error("[saferagents] audit write failed", String(e))),
   );
@@ -2281,7 +2297,7 @@ CPU figures come from `wrangler tail` against a staging proxy whose upstream is 
 - Paid plan base fee ($5/mo), which includes request and CPU-ms allocations;
 - guarded requests × proxy CPU-ms, plus tool calls × scanner CPU-ms, beyond the included allocation;
 - judge calls × model price, for suspicious calls only. Workers AI catalog: `llama-3.3-70b-instruct-fp8-fast` costs $0.293 per M input and $2.253 per M output tokens; `clef-flash` costs $0.038 per M input with no output charge;
-- R2: one small object per non-passed call. Negligible at single-user volume.
+- R2: one small object per audited call (non-passed, or passed with a scanner/judge note; `AUDIT_MODE`, §8.1). Negligible at single-user volume.
 - **Example (single heavy user, ~17,500 tool calls/mo):** ~17,500 × ~250 ms ≈ 4.4 M scanner CPU-ms per month. Judge: ~5% suspicious ≈ 900 calls × $0.000012 ≈ $0.01/mo with clef-flash.
 
 Wall-clock time spent waiting on upstream I/O is not billed as CPU.
@@ -2330,7 +2346,7 @@ The harness's credential goes through the proxy unchanged: `x-api-key` for an AP
 
 **Verification checklist.** Each item is enforced in code and covered by tests (§9.1):
 - **Forward-only destination:** each `UPSTREAM_*_URL` defaults to, and must equal, its official API (`https://api.anthropic.com`, `https://api.openai.com`, `https://api.x.ai`, `https://generativelanguage.googleapis.com`); `loadConfig` refuses to start otherwise. The only exception is an explicit `ALLOW_CUSTOM_UPSTREAM=true`. Provider keys pass through as sent (`x-api-key`, `Authorization`, `x-goog-api-key` or Gemini's `?key=`) and are never logged. The proxy makes no other outbound requests; the scanner and judge are bindings and receive no headers.
-- **Never stored:** request headers are not passed to `Guard`, `audit()`, the scanner or the judge. Only the sanitized `x-session-id` value is read. Audit records (`audit.ts`) contain only the verdict, tool, scrubbed arguments, findings and scrubbed task text. `console.*` calls log only the verdict and tool name, and there is no KV, D1 or Durable Object binding.
+- **Never stored:** request headers are not passed to `Guard`, `audit()`, the scanner or the judge. Only the sanitized `x-session-id` value is read. Audit records are written to R2 only when `TRACE_BUCKET` is bound and `AUDIT_MODE` is `all` (the default; `off` disables writes). Audit records (`audit.ts`) contain only the verdict, tool, scrubbed arguments, findings and scrubbed task text. `console.*` calls log only the verdict, tool, and a scrubbed reason/judge/note line truncated to 300 characters, and there is no KV, D1 or Durable Object binding.
 - **Not leaked upstream:** `x-saferagents-key` and the `cf-*` and `x-forwarded-*` headers are stripped before forwarding (`upstreamHeaders`).
 - **Tests:** a unit test sends a request with a sentinel `x-api-key` / `Authorization` value and asserts that the sentinel appears only in the upstream `fetch` call. It must not appear in R2 writes, console output, the scanner payload or the judge prompt.
 
@@ -2444,7 +2460,7 @@ Local proxy mode, interactive monitor, an `inspect` command, plugin loading from
 
 | Gate | Result |
 |---|---|
-| Unit (§9.1, §9.3) | 491 proxy tests in `workerd`; 46 scanner tests (CPython 3.14) |
+| Unit (§9.1, §9.3) | 494 proxy tests in `workerd`; 46 scanner tests (CPython 3.14) |
 | Python Worker as RPC target | TS → Python `WorkerEntrypoint.scan(str) -> str` over a service binding, locally and deployed; RPC overhead ~2 ms |
 | atif-scan under Pyodide | Engine builds (126 detectors, 2 access rules, 2 allowances) with no third-party modules; findings identical to CPython |
 | Parity (§9.2) | 226 recorded Claude Code requests (`claude --bare`, 44 coding tasks on a throwaway repo, 240 tool calls) + 240 synthetic, 466 total. Traces equal upstream apart from the cap; findings identical on all 659 calls (cap delta 0%); policy a superset of upstream, all 117 extra blocks documented deviations, none on recorded traffic |

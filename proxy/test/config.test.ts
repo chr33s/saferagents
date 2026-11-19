@@ -21,6 +21,7 @@ describe("loadConfig", () => {
       judgeTimeoutMs: 15000,
       traceAgentSteps: 20,
       traceMaxResultChars: 2000,
+      auditMode: "all",
     });
     expect(c.allowedHosts).toContain("registry.npmjs.org");
     expect(c.allowedHosts).toContain("example.org");
@@ -38,6 +39,7 @@ describe("loadConfig", () => {
     ["SERVER_TOOLS", "block"],
     ["SCANNER_TIMEOUT_MS", "-1"],
     ["JUDGE_TIMEOUT_MS", "1.5"],
+    ["AUDIT_MODE", "opt-in"],
     ["TRACE_AGENT_STEPS", "0"],
     ["TRACE_MAX_RESULT_CHARS", "abc"],
     ["JUDGE_BLOCK_THRESHOLD", "0"],
